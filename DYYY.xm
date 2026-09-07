@@ -13389,13 +13389,129 @@ static void dyyyDiagDoReport(id panelVC) {
     });
 }
 
+// ===== 2.2-9.3 输入栏宿主全局定位与清理（诊断降级为后台 log） =====
+static BOOL dyyyInputBarFixed = NO;
+static BOOL dyyyInputFixScheduled = NO;
+
+static BOOL dyyyIsOpaqueWhiteBg(UIView *view) {
+    UIColor *bg = view.backgroundColor;
+    if (!bg) return NO;
+    size_t n = CGColorGetNumberOfComponents(bg.CGColor);
+    const CGFloat *c = CGColorGetComponents(bg.CGColor);
+    if (CGColorGetAlpha(bg.CGColor) < 0.9f) return NO;
+    if (n == 2) return c[0] >= 0.9f;
+    if (n >= 4) return c[0] >= 0.9f && c[1] >= 0.9f && c[2] >= 0.9f;
+    return NO;
+}
+
+// 深度优先找输入控件：优先“发条评论”占位文本，其次 UITextView/UITextField
+static UIView *dyyyFindInputLeafInView(UIView *view, UIView *skipView) {
+    if (view == nil || view == skipView) return nil;
+    if ([view isKindOfClass:[UILabel class]]) {
+        NSString *t = ((UILabel *)view).text;
+        if (t && [t rangeOfString:@"发条评论"].location != NSNotFound) return view;
+    }
+    if ([view isKindOfClass:[UITextView class]] || [view isKindOfClass:[UITextField class]]) return view;
+    for (UIView *sub in view.subviews) {
+        UIView *hit = dyyyFindInputLeafInView(sub, skipView);
+        if (hit) return hit;
+    }
+    return nil;
+}
+
+// 从输入控件向上找第一个纯白/UIVisualEffectView 宿主
+static UIView *dyyyWhiteHostAboveView(UIView *leaf) {
+    UIView *cur = leaf.superview;
+    int depth = 0;
+    while (cur && depth < 12) {
+        if ([cur isKindOfClass:[UIVisualEffectView class]] || dyyyIsOpaqueWhiteBg(cur)) return cur;
+        cur = cur.superview;
+        depth++;
+    }
+    return nil;
+}
+
+static void dyyyFixInputHost(UIView *host, NSMutableString *log) {
+    [log appendFormat:@" host=%@ frame=%@", NSStringFromClass([host class]), NSStringFromCGRect(host.frame)];
+    if ([host isKindOfClass:[UIVisualEffectView class]]) {
+        // 材质型白底：摘掉 effect 以露出面板层毛玻璃
+        ((UIVisualEffectView *)host).effect = nil;
+        [log appendString:@" ->effect=nil"];
+    } else {
+        host.backgroundColor = [UIColor clearColor];
+        host.opaque = NO;
+        [log appendString:@" ->bg=clear"];
+    }
+    // 宿主内部近白子容器一并清（避开文本/按钮类）
+    for (UIView *sub in host.subviews) {
+        if (![sub isKindOfClass:[UILabel class]] && dyyyIsOpaqueWhiteBg(sub)) {
+            sub.backgroundColor = [UIColor clearColor];
+            sub.opaque = NO;
+            [log appendFormat:@" |sub %@ clear", NSStringFromClass([sub class])];
+        }
+    }
+}
+
+static void dyyyInputBarFixOnce(id panelVC) {
+    if (dyyyInputBarFixed) return;
+    UIView *panelView = ((UIViewController *)panelVC).view;
+    if (!panelView) return;
+    NSMutableString *log = [NSMutableString string];
+    [log appendString:@"[DYYY-INPUT]"];
+
+    // 沿面板父链向上找容器，找不到再退回 keyWindow 全树
+    UIView *inputLeaf = nil;
+    UIView *container = panelView.superview;
+    while (container && !inputLeaf) {
+        inputLeaf = dyyyFindInputLeafInView(container, panelView);
+        container = container.superview;
+    }
+    if (!inputLeaf) {
+        UIWindow *kw = [[UIApplication sharedApplication] keyWindow];
+        if (kw) inputLeaf = dyyyFindInputLeafInView(kw, panelView);
+    }
+    if (!inputLeaf) {
+        [log appendString:@" 未定位到输入控件，稍后重试"];
+        NSLog(@"%@", log);
+        return;
+    }
+    [log appendFormat:@" leaf=%@ frame=%@", NSStringFromClass([inputLeaf class]), NSStringFromCGRect(inputLeaf.frame)];
+
+    UIView *host = dyyyWhiteHostAboveView(inputLeaf);
+    if (!host) {
+        [log appendString:@" 无白色宿主（输入栏已透明），标记完成"];
+        NSLog(@"%@", log);
+        dyyyInputBarFixed = YES;
+        return;
+    }
+    // 仅处理落在面板底部区域(输入栏)的宿主，避免误伤上部白色层
+    CGRect hf = host.frame;
+    if (hf.size.width < 1 || hf.size.height < 1 ||
+        CGRectGetMaxY(hf) < CGRectGetMaxY(panelView.frame) - 120.0f) {
+        [log appendString:@" 宿主不在面板底部区域，跳过并标记完成"];
+        NSLog(@"%@", log);
+        dyyyInputBarFixed = YES;
+        return;
+    }
+    dyyyFixInputHost(host, log);
+    dyyyInputBarFixed = YES;
+    NSLog(@"%@", log);
+}
+
 static void dyyyTryDiagnoseInputArea(id panelVC) {
     if (!DYYYGetBool(@"DYYYEnableCommentBlur")) return;
-    if (dyyyDiagBlurInputDone) return;
-    dyyyDiagBlurInputDone = YES;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        dyyyDiagDoReport(panelVC);
-    });
+    if (dyyyInputBarFixed) return;
+    dyyyInputBarFixOnce(panelVC);
+    // 输入栏可能延迟挂载：未成功时在 0.5s~5s 窗口内逐步重试，只排一次队列
+    if (!dyyyInputBarFixed && !dyyyInputFixScheduled) {
+        dyyyInputFixScheduled = YES;
+        for (int i = 1; i <= 10; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                if (dyyyInputBarFixed) return;
+                dyyyInputBarFixOnce(panelVC);
+            });
+        }
+    }
 }
 
 static void dyyyPanelViewDidLayoutSubviewsSwizzled(id self, SEL _cmd) {
