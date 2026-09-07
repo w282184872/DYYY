@@ -13389,9 +13389,12 @@ static void dyyyDiagDoReport(id panelVC) {
     });
 }
 
-// ===== 2.2-9.4 评论区毛玻璃守护轮询（修复 cell 复用白块 / 切视频整白底） =====
-// v3 一次性静态标志在 cell 复用与切视频重置背景后失效；v4 改为面板存在期间持续守护：
-// 每 0.6s 幂等执行 1) 递归清面板树不透明白底 + 刷新/补建 tag999 毛玻璃；2) 清独立层级输入栏白底宿主。
+// ===== 2.2-9.5 评论区毛玻璃守护（修复 cell 复用白块 / 首帧白 / 下拉残留） =====
+// v3 一次性静态标志失效；v4 改面板生命周期守护（0.6s）；v5 在该基础上：
+// 1) viewWillAppear 挂窗前置于 layout 清首帧白；2) layout 完成后立即双通道清白底；
+// 3) 对评论 cell 类源头 swizzle layoutSubviews（cell 一布局即清，0 延迟）；
+// 4) 双通道清理 view.backgroundColor 与 layer.backgroundColor；非 tag999 近不透明 effect 摘材质；
+// 5) 守护间隔 0.6s -> 0.1s，滚动/下拉新建 cell 的可见窗口期趋近于 0。
 // 停止条件：面板视图脱离窗口（关闭/切走），解除守护标记，允许下次打开重新启动。
 static void *dyyyCommentGuardAssocKey = &dyyyCommentGuardAssocKey;
 
@@ -13495,12 +13498,140 @@ static BOOL dyyyFixInputBarIfNeeded(id panelVC) {
     return YES;
 }
 
+// ===== 2.2-9.5 评论区毛玻璃彻底修复：双通道清白底 + cell 源头清理 + 挂窗前置于 viewWillAppear =====
+// 1) 双通道：同时清 view.backgroundColor 与 view.layer.backgroundColor（layer 直设背景是 SwiftUI/异步渲染常见白块来源）。
+// 2) tag999 是自身添加的毛玻璃层，整棵保留（含其 contentView 遮罩），避免误删。
+// 3) 非 tag999 的 UIVisualEffectView 若接近不透明（alpha>=0.85），判为材质型白块，摘 effect 露出下层。
+static BOOL dyyyCGColorIsWhiteish(CGColorRef cg) {
+    if (!cg) return NO;
+    CGColorSpaceRef space = CGColorGetColorSpace(cg);
+    if (!space) return NO;
+    CGColorSpaceModel model = CGColorGetColorSpaceModel(space);
+    const CGFloat *c = CGColorGetComponents(cg);
+    if (model == kCGColorSpaceModelMonochrome) return c[0] >= 0.9f;
+    if (model == kCGColorSpaceModelRGB) return (c[0] >= 0.9f && c[1] >= 0.9f && c[2] >= 0.9f);
+    return NO;
+}
+
+static void dyyyClearCommentWhiteTree(UIView *view) {
+    if (!view) return;
+    if (view.tag == 999) return; // 保留自身毛玻璃层整棵（含 contentView 遮罩）
+    if ([view isKindOfClass:[UIVisualEffectView class]]) {
+        UIVisualEffectView *ev = (UIVisualEffectView *)view;
+        if (view.alpha >= 0.85f) { // 近不透明材质 -> 白块来源，摘 effect
+            ev.effect = nil;
+            view.backgroundColor = [UIColor clearColor];
+            view.opaque = NO;
+        }
+        // 摘除后继续下钻清 contentView 内子视图
+    }
+    UIColor *bg = view.backgroundColor;
+    if (bg) {
+        CGColorRef cg = bg.CGColor;
+        if (CGColorGetAlpha(cg) >= 0.9f && dyyyCGColorIsWhiteish(cg)) {
+            view.backgroundColor = [UIColor clearColor];
+            view.opaque = NO;
+        }
+    }
+    CGColorRef layerBg = view.layer.backgroundColor;
+    if (layerBg) {
+        if (CGColorGetAlpha(layerBg) >= 0.9f && dyyyCGColorIsWhiteish(layerBg)) {
+            view.layer.backgroundColor = NULL;
+            view.opaque = NO;
+        }
+    }
+    for (UIView *sub in view.subviews) {
+        dyyyClearCommentWhiteTree(sub);
+    }
+}
+
+// ===== cell 级源头清理：对实际使用的评论 cell 类动态 swizzle layoutSubviews，一布局即清自身白底（0 延迟） =====
+static void *dyyyCellOrigIMPAssocKey = &dyyyCellOrigIMPAssocKey;
+static NSMutableSet *dyyySwizzledCellClasses = nil;
+
+static void dyyyCommentCellLayoutSubviewsSwizzled(id self, SEL _cmd) {
+    Class cls = object_getClass(self);
+    NSValue *val = objc_getAssociatedObject(cls, dyyyCellOrigIMPAssocKey);
+    IMP orig = val ? [val pointerValue] : NULL;
+    if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
+    dyyyClearCommentWhiteTree(self); // 布局完成立即清白底，抢在渲染前
+}
+
+static void dyyySwizzleCommentCellOnce(Class cellClass) {
+    if (!cellClass) return;
+    if (![cellClass isSubclassOfClass:[UITableViewCell class]] &&
+        ![cellClass isSubclassOfClass:[UICollectionViewCell class]]) return;
+    if (!dyyySwizzledCellClasses) dyyySwizzledCellClasses = [NSMutableSet set];
+    NSString *clsName = NSStringFromClass(cellClass);
+    if (!clsName || [dyyySwizzledCellClasses containsObject:clsName]) return;
+
+    SEL layoutSel = @selector(layoutSubviews);
+    Method layoutMethod = class_getInstanceMethod(cellClass, layoutSel);
+    if (!layoutMethod) return;
+    IMP origIMP = method_getImplementation(layoutMethod);
+    const char *typeEncoding = method_getTypeEncoding(layoutMethod);
+    // 无论 cellClass 原本是否实现 layoutSubviews，都先把原 IMP 存好：
+    // 自身未实现（Method 来自父类）时 class_addMethod 直接成功后也要能回调父类原实现。
+    objc_setAssociatedObject(cellClass, dyyyCellOrigIMPAssocKey,
+                             [NSValue valueWithPointer:origIMP], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    class_addMethod(cellClass, layoutSel, (IMP)dyyyCommentCellLayoutSubviewsSwizzled, typeEncoding);
+    Method currentMethod = class_getInstanceMethod(cellClass, layoutSel);
+    IMP currentIMP = method_getImplementation(currentMethod);
+    if (currentIMP != (IMP)dyyyCommentCellLayoutSubviewsSwizzled) {
+        method_setImplementation(currentMethod, (IMP)dyyyCommentCellLayoutSubviewsSwizzled);
+    }
+    [dyyySwizzledCellClasses addObject:clsName];
+    NSLog(@"[DYYY] comment cell swizzled: %@", clsName);
+}
+
+static void dyyyCollectCommentScrollViews(UIView *view, NSMutableArray *outArr) {
+    if (!view) return;
+    if ([view isKindOfClass:[UIScrollView class]]) { [outArr addObject:view]; return; } // 滚动容器内部不再下钻
+    for (UIView *sub in view.subviews) {
+        dyyyCollectCommentScrollViews(sub, outArr);
+    }
+}
+
+static void dyyyScanCommentCellsAndSwizzle(id panelVC) {
+    UIView *panelView = ((UIViewController *)panelVC).view;
+    if (!panelView) return;
+    NSMutableArray *scrolls = [NSMutableArray array];
+    dyyyCollectCommentScrollViews(panelView, scrolls);
+    for (UIView *sv in scrolls) {
+        NSArray *visibleCells = nil;
+        if ([sv isKindOfClass:[UITableView class]]) {
+            visibleCells = ((UITableView *)sv).visibleCells;
+        } else if ([sv isKindOfClass:[UICollectionView class]]) {
+            visibleCells = ((UICollectionView *)sv).visibleCells;
+        }
+        if (!visibleCells) continue;
+        for (UIView *cell in visibleCells) {
+            dyyySwizzleCommentCellOnce(object_getClass(cell));
+        }
+    }
+}
+
+// ===== 挂窗前置于 viewWillAppear：布局前的首帧白也拦截（守护由随后的 viewDidLayoutSubviews 启动） =====
+static IMP dyyyOrigPanelViewWillAppear = NULL;
+
+static void dyyyPanelViewWillAppearSwizzled(id self, SEL _cmd, BOOL animated) {
+    if (dyyyOrigPanelViewWillAppear) ((void (*)(id, SEL, BOOL))dyyyOrigPanelViewWillAppear)(self, _cmd, animated);
+    if (!DYYYGetBool(@"DYYYEnableCommentBlur")) return;
+    if (![NSStringFromClass([self class]) containsString:@"CommentContainerInnerViewController"]) return;
+    UIView *pv = ((UIViewController *)self).view;
+    if (pv) dyyyClearCommentWhiteTree(pv);
+    dyyyPanelApplyBlurIfNeeded(self);
+    dyyyFixInputBarIfNeeded(self);
+}
+
 // 单轮守护：幂等清理；面板视图已脱离窗口时返回 NO 以停止守护
 static BOOL dyyyCommentGuardTickOnce(id panelVC) {
     UIView *panelView = ((UIViewController *)panelVC).view;
     if (!panelView || !panelView.window) return NO;
-    dyyyPanelApplyBlurIfNeeded(panelVC);  // 面板树递归清白底 + 刷新/补建 tag999 毛玻璃（幂等）
-    dyyyFixInputBarIfNeeded(panelVC);     // 独立层级的输入栏宿主持续清理
+    dyyyScanCommentCellsAndSwizzle(panelVC); // 2.2-9.5: 收集可见 cell 并源头 swizzle（新复用 cell 类首次出现即挂 hook）
+    dyyyClearCommentWhiteTree(panelView);    // 2.2-9.5: 双通道清白底（backgroundColor + layer.backgroundColor）
+    dyyyPanelApplyBlurIfNeeded(panelVC);     // 面板树递归清白底 + 刷新/补建 tag999 毛玻璃（幂等）
+    dyyyFixInputBarIfNeeded(panelVC);        // 独立层级的输入栏宿主持续清理
     return YES;
 }
 
@@ -13509,7 +13640,7 @@ static void dyyyCommentGuardLoop(id panelVC) {
         objc_setAssociatedObject(panelVC, dyyyCommentGuardAssocKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         return;
     }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         dyyyCommentGuardLoop(panelVC);
     });
 }
@@ -13528,6 +13659,8 @@ static void dyyyPanelViewDidLayoutSubviewsSwizzled(id self, SEL _cmd) {
     if (dyyyOrigPanelViewDidLayoutSubviews) {
         ((void (*)(id, SEL))dyyyOrigPanelViewDidLayoutSubviews)(self, _cmd);
     }
+    UIView *pv = ((UIViewController *)self).view;
+    if (pv) dyyyClearCommentWhiteTree(pv); // 2.2-9.5: layout 完成后立即双通道清白底（不等轮询）
     dyyyPanelApplyBlurIfNeeded(self);
     dyyyFixInputBarIfNeeded(self);
     dyyyStartCommentGuard(self);
@@ -13554,6 +13687,22 @@ static void dyyyTrySwizzleBlurPanel(void) {
     if (currentIMP != (IMP)dyyyPanelViewDidLayoutSubviewsSwizzled) {
         method_setImplementation(currentMethod, (IMP)dyyyPanelViewDidLayoutSubviewsSwizzled);
     }
+
+    // 2.2-9.5: 同步挂 viewWillAppear，打开首帧即清白底+建毛玻璃（抢先于首次 layout 的白帧）
+    SEL appearSel = @selector(viewWillAppear:);
+    Method appearMethod = class_getInstanceMethod(panelClass, appearSel);
+    if (appearMethod) {
+        dyyyOrigPanelViewWillAppear = method_getImplementation(appearMethod);
+        const char *appearTypeEncoding = method_getTypeEncoding(appearMethod);
+        class_addMethod(panelClass, appearSel, (IMP)dyyyPanelViewWillAppearSwizzled, appearTypeEncoding);
+        Method currentAppearMethod = class_getInstanceMethod(panelClass, appearSel);
+        IMP currentAppearIMP = method_getImplementation(currentAppearMethod);
+        if (currentAppearIMP != (IMP)dyyyPanelViewWillAppearSwizzled) {
+            method_setImplementation(currentAppearMethod, (IMP)dyyyPanelViewWillAppearSwizzled);
+        }
+        NSLog(@"[DYYY] comment blur panel viewWillAppear swizzled");
+    }
+
     dyyyBlurPanelSwizzled = YES;
     NSLog(@"[DYYY] comment blur panel swizzled: %s", class_getName(panelClass));
 }
