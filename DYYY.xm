@@ -13545,8 +13545,10 @@ static void dyyyClearCommentWhiteTree(UIView *view) {
     }
 }
 
-// ===== cell 级源头清理：对实际使用的评论 cell 类动态 swizzle layoutSubviews，一布局即清自身白底（0 延迟） =====
-static void *dyyyCellOrigIMPAssocKey = &dyyyCellOrigIMPAssocKey;
+// ===== cell 级源头清理：对实际使用的评论 cell 类动态 swizzle，覆盖布局/复用/挂窗三个时机 =====
+static void *dyyyCellOrigIMPAssocKey = &dyyyCellOrigIMPAssocKey;                    // layoutSubviews 原 IMP
+static void *dyyyCellOrigPrepareForReuseIMPKey = &dyyyCellOrigPrepareForReuseIMPKey; // prepareForReuse 原 IMP
+static void *dyyyCellOrigDidMoveToWindowIMPKey = &dyyyCellOrigDidMoveToWindowIMPKey; // didMoveToWindow 原 IMP
 static NSMutableSet *dyyySwizzledCellClasses = nil;
 
 static void dyyyCommentCellLayoutSubviewsSwizzled(id self, SEL _cmd) {
@@ -13557,6 +13559,37 @@ static void dyyyCommentCellLayoutSubviewsSwizzled(id self, SEL _cmd) {
     dyyyClearCommentWhiteTree(self); // 布局完成立即清白底，抢在渲染前
 }
 
+static void dyyyCommentCellPrepareForReuseSwizzled(id self, SEL _cmd) {
+    Class cls = object_getClass(self);
+    NSValue *val = objc_getAssociatedObject(cls, dyyyCellOrigPrepareForReuseIMPKey);
+    IMP orig = val ? (IMP)[val pointerValue] : NULL;
+    if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
+    dyyyClearCommentWhiteTree(self); // 复用瞬间清残留，先于下一次数据绑定（防旧白底串到新评论）
+}
+
+static void dyyyCommentCellDidMoveToWindowSwizzled(id self, SEL _cmd) {
+    Class cls = object_getClass(self);
+    NSValue *val = objc_getAssociatedObject(cls, dyyyCellOrigDidMoveToWindowIMPKey);
+    IMP orig = val ? (IMP)[val pointerValue] : NULL;
+    if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
+    if (((UIView *)self).window) dyyyClearCommentWhiteTree(self); // 挂窗即清，拦截首屏白
+}
+
+// 通用：给 cell 类添加某个 selector 的 hook（保留父类原 IMP；类自身未实现时 class_addMethod 落到类级，不污染父类）
+static void dyyySwizzleCellMethodOnce(Class cellClass, SEL sel, IMP hookIMP, void *assocKey) {
+    Method m = class_getInstanceMethod(cellClass, sel);
+    if (!m) return;
+    IMP origIMP = method_getImplementation(m);
+    const char *typeEncoding = method_getTypeEncoding(m);
+    objc_setAssociatedObject(cellClass, assocKey,
+                             [NSValue valueWithPointer:(const void *)origIMP], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    class_addMethod(cellClass, sel, hookIMP, typeEncoding);
+    Method cur = class_getInstanceMethod(cellClass, sel);
+    if (method_getImplementation(cur) != hookIMP) {
+        method_setImplementation(cur, hookIMP);
+    }
+}
+
 static void dyyySwizzleCommentCellOnce(Class cellClass) {
     if (!cellClass) return;
     if (![cellClass isSubclassOfClass:[UITableViewCell class]] &&
@@ -13565,23 +13598,12 @@ static void dyyySwizzleCommentCellOnce(Class cellClass) {
     NSString *clsName = NSStringFromClass(cellClass);
     if (!clsName || [dyyySwizzledCellClasses containsObject:clsName]) return;
 
-    SEL layoutSel = @selector(layoutSubviews);
-    Method layoutMethod = class_getInstanceMethod(cellClass, layoutSel);
-    if (!layoutMethod) return;
-    IMP origIMP = method_getImplementation(layoutMethod);
-    const char *typeEncoding = method_getTypeEncoding(layoutMethod);
-    // 无论 cellClass 原本是否实现 layoutSubviews，都先把原 IMP 存好：
-    // 自身未实现（Method 来自父类）时 class_addMethod 直接成功后也要能回调父类原实现。
-    objc_setAssociatedObject(cellClass, dyyyCellOrigIMPAssocKey,
-                             [NSValue valueWithPointer:(const void *)origIMP], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    class_addMethod(cellClass, layoutSel, (IMP)dyyyCommentCellLayoutSubviewsSwizzled, typeEncoding);
-    Method currentMethod = class_getInstanceMethod(cellClass, layoutSel);
-    IMP currentIMP = method_getImplementation(currentMethod);
-    if (currentIMP != (IMP)dyyyCommentCellLayoutSubviewsSwizzled) {
-        method_setImplementation(currentMethod, (IMP)dyyyCommentCellLayoutSubviewsSwizzled);
-    }
+    dyyySwizzleCellMethodOnce(cellClass, @selector(layoutSubviews), (IMP)dyyyCommentCellLayoutSubviewsSwizzled, dyyyCellOrigIMPAssocKey);
+    dyyySwizzleCellMethodOnce(cellClass, @selector(prepareForReuse), (IMP)dyyyCommentCellPrepareForReuseSwizzled, dyyyCellOrigPrepareForReuseIMPKey);
+    dyyySwizzleCellMethodOnce(cellClass, @selector(didMoveToWindow), (IMP)dyyyCommentCellDidMoveToWindowSwizzled, dyyyCellOrigDidMoveToWindowIMPKey);
+
     [dyyySwizzledCellClasses addObject:clsName];
-    NSLog(@"[DYYY] comment cell swizzled: %@", clsName);
+    NSLog(@"[DYYY] comment cell swizzled: %@ (layout/prepareForReuse/didMoveToWindow)", clsName);
 }
 
 static void dyyyCollectCommentScrollViews(UIView *view, NSMutableArray *outArr) {
@@ -13611,6 +13633,137 @@ static void dyyyScanCommentCellsAndSwizzle(id panelVC) {
     }
 }
 
+// ===== v6 标题行白块根治：对反复出现白底的宿主类做 setter 级源头拦截 =====
+// 近白不透明 backgroundColor 在 set 时直接改 clear，白色再也设不进去，从机制上消灭"清完又白/闪烁"。
+static void *dyyyHostColorOrigIMPKey = &dyyyHostColorOrigIMPKey;   // setBackgroundColor: 原 IMP
+static void *dyyyHostEffectOrigIMPKey = &dyyyHostEffectOrigIMPKey; // setEffect: 原 IMP
+static NSMutableSet *dyyySwizzledHostColorClasses = nil;
+static NSMutableSet *dyyySwizzledHostEffectClasses = nil;
+
+static BOOL dyyyUIColorNearWhiteOpaque(UIColor *c) {
+    if (!c) return NO;
+    CGColorRef cg = c.CGColor;
+    return cg && CGColorGetAlpha(cg) >= 0.9f && dyyyCGColorIsWhiteish(cg);
+}
+
+static void dyyyHostSetBackgroundColorSwizzled(id self, SEL _cmd, UIColor *color) {
+    Class cls = object_getClass(self);
+    NSValue *val = objc_getAssociatedObject(cls, dyyyHostColorOrigIMPKey);
+    IMP orig = val ? (IMP)[val pointerValue] : NULL;
+    if (dyyyUIColorNearWhiteOpaque(color)) {
+        color = [UIColor clearColor];
+        ((UIView *)self).opaque = NO;
+        // 顺带清一次 layer 底色：layer.backgroundColor 的独立残留一并去掉
+        CGColorRef lc = ((UIView *)self).layer.backgroundColor;
+        if (lc && CGColorGetAlpha(lc) >= 0.9f && dyyyCGColorIsWhiteish(lc)) {
+            ((UIView *)self).layer.backgroundColor = NULL;
+        }
+    }
+    if (orig) ((void (*)(id, SEL, UIColor *))orig)(self, _cmd, color);
+}
+
+static void dyyyHostSetEffectSwizzled(id self, SEL _cmd, UIVisualEffect *effect) {
+    Class cls = object_getClass(self);
+    NSValue *val = objc_getAssociatedObject(cls, dyyyHostEffectOrigIMPKey);
+    IMP orig = val ? (IMP)[val pointerValue] : NULL;
+    // 非 tag999 宿主出现材质即摘除（宿主被识别即代表它当前呈现白块）
+    if (effect && ((UIView *)self).tag != 999) {
+        effect = nil;
+        ((UIView *)self).backgroundColor = [UIColor clearColor];
+        ((UIView *)self).opaque = NO;
+    }
+    if (orig) ((void (*)(id, SEL, UIVisualEffect *))orig)(self, _cmd, effect);
+}
+
+static void dyyySwizzleHostColorSetterOnce(Class cls) {
+    if (!cls) return;
+    if (!dyyySwizzledHostColorClasses) dyyySwizzledHostColorClasses = [NSMutableSet set];
+    NSString *name = NSStringFromClass(cls);
+    if (!name || [dyyySwizzledHostColorClasses containsObject:name]) return;
+    Method m = class_getInstanceMethod(cls, @selector(setBackgroundColor:));
+    if (!m) return;
+    IMP origIMP = method_getImplementation(m);
+    objc_setAssociatedObject(cls, dyyyHostColorOrigIMPKey,
+                             [NSValue valueWithPointer:(const void *)origIMP], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    const char *te = method_getTypeEncoding(m);
+    class_addMethod(cls, @selector(setBackgroundColor:), (IMP)dyyyHostSetBackgroundColorSwizzled, te);
+    Method cur = class_getInstanceMethod(cls, @selector(setBackgroundColor:));
+    if (method_getImplementation(cur) != (IMP)dyyyHostSetBackgroundColorSwizzled) {
+        method_setImplementation(cur, (IMP)dyyyHostSetBackgroundColorSwizzled);
+    }
+    [dyyySwizzledHostColorClasses addObject:name];
+    NSLog(@"[DYYY] white host setter hooked: %@", name);
+}
+
+static void dyyySwizzleHostEffectSetterOnce(Class cls) {
+    if (!cls) return;
+    if (!dyyySwizzledHostEffectClasses) dyyySwizzledHostEffectClasses = [NSMutableSet set];
+    NSString *name = NSStringFromClass(cls);
+    if (!name || [dyyySwizzledHostEffectClasses containsObject:name]) return;
+    Method m = class_getInstanceMethod(cls, @selector(setEffect:));
+    if (!m) return;
+    IMP origIMP = method_getImplementation(m);
+    objc_setAssociatedObject(cls, dyyyHostEffectOrigIMPKey,
+                             [NSValue valueWithPointer:(const void *)origIMP], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    const char *te = method_getTypeEncoding(m);
+    class_addMethod(cls, @selector(setEffect:), (IMP)dyyyHostSetEffectSwizzled, te);
+    Method cur = class_getInstanceMethod(cls, @selector(setEffect:));
+    if (method_getImplementation(cur) != (IMP)dyyyHostSetEffectSwizzled) {
+        method_setImplementation(cur, (IMP)dyyyHostSetEffectSwizzled);
+    }
+    [dyyySwizzledHostEffectClasses addObject:name];
+    NSLog(@"[DYYY] white effect host hooked: %@", name);
+}
+
+// 扫描 view 子树，收集当前呈现白底（backgroundColor / layer.backgroundColor / 材质 effect）的嫌疑宿主实例
+static void dyyyScanWhiteHostInView(UIView *v, NSMutableArray *outHosts) {
+    if (!v) return;
+    if (v.tag == 999) return; // 自身毛玻璃层整棵跳过
+    if ([v isKindOfClass:[UIVisualEffectView class]]) {
+        UIVisualEffectView *ev = (UIVisualEffectView *)v;
+        if (ev.effect && v.alpha >= 0.85f) [outHosts addObject:v];
+    }
+    BOOL isWhite = NO;
+    UIColor *bg = v.backgroundColor;
+    if (bg && CGColorGetAlpha(bg.CGColor) >= 0.9f && dyyyCGColorIsWhiteish(bg.CGColor)) isWhite = YES;
+    if (!isWhite) {
+        CGColorRef lc = v.layer.backgroundColor;
+        if (lc && CGColorGetAlpha(lc) >= 0.9f && dyyyCGColorIsWhiteish(lc)) isWhite = YES;
+    }
+    if (isWhite) [outHosts addObject:v];
+    for (UIView *sub in v.subviews) {
+        dyyyScanWhiteHostInView(sub, outHosts);
+    }
+}
+
+// v6: 节流式扫描评论可见 cell 树，发现白底宿主类即做 setter 级拦截（幂等，每 5 个 tick 跑一次）
+static void dyyyScanWhiteHostsAndSwizzle(id panelVC) {
+    UIView *panelView = ((UIViewController *)panelVC).view;
+    if (!panelView) return;
+    NSMutableArray *scrolls = [NSMutableArray array];
+    dyyyCollectCommentScrollViews(panelView, scrolls);
+    NSMutableArray *hosts = [NSMutableArray array];
+    for (UIView *sv in scrolls) {
+        NSArray *visibleCells = nil;
+        if ([sv isKindOfClass:[UITableView class]]) {
+            visibleCells = ((UITableView *)sv).visibleCells;
+        } else if ([sv isKindOfClass:[UICollectionView class]]) {
+            visibleCells = ((UICollectionView *)sv).visibleCells;
+        }
+        if (!visibleCells) continue;
+        for (UIView *cell in visibleCells) {
+            dyyyScanWhiteHostInView(cell, hosts);
+        }
+    }
+    for (UIView *h in hosts) {
+        Class cls = object_getClass(h);
+        dyyySwizzleHostColorSetterOnce(cls);
+        if ([h isKindOfClass:[UIVisualEffectView class]]) {
+            dyyySwizzleHostEffectSetterOnce(cls);
+        }
+    }
+}
+
 // ===== 挂窗前置于 viewWillAppear：布局前的首帧白也拦截（守护由随后的 viewDidLayoutSubviews 启动） =====
 static IMP dyyyOrigPanelViewWillAppear = NULL;
 
@@ -13629,6 +13782,10 @@ static BOOL dyyyCommentGuardTickOnce(id panelVC) {
     UIView *panelView = ((UIViewController *)panelVC).view;
     if (!panelView || !panelView.window) return NO;
     dyyyScanCommentCellsAndSwizzle(panelVC); // 2.2-9.5: 收集可见 cell 并源头 swizzle（新复用 cell 类首次出现即挂 hook）
+    static int dyyyHostScanDiv = 0;
+    if ((++dyyyHostScanDiv % 5) == 0) {
+        dyyyScanWhiteHostsAndSwizzle(panelVC); // v6: 发现白底宿主类并做 setter 级拦截（0.25s 节流）
+    }
     dyyyClearCommentWhiteTree(panelView);    // 2.2-9.5: 双通道清白底（backgroundColor + layer.backgroundColor）
     dyyyPanelApplyBlurIfNeeded(panelVC);     // 面板树递归清白底 + 刷新/补建 tag999 毛玻璃（幂等）
     dyyyFixInputBarIfNeeded(panelVC);        // 独立层级的输入栏宿主持续清理
@@ -13640,7 +13797,7 @@ static void dyyyCommentGuardLoop(id panelVC) {
         objc_setAssociatedObject(panelVC, dyyyCommentGuardAssocKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         return;
     }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         dyyyCommentGuardLoop(panelVC);
     });
 }
