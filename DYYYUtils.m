@@ -931,6 +931,32 @@ static void DYYYApplyDisplayLocationToLabel(UILabel *label, NSString *displayLoc
     return [resultViews copy];
 }
 
++ (NSArray<__kindof UIView *> *)findAllSubviewsWithClassNameContaining:(NSString *)nameFragment inContainer:(id)container {
+    if (!nameFragment.length || !container) {
+        return @[];
+    }
+
+    UIView *startView = nil;
+    if ([container isKindOfClass:[UIView class]]) {
+        startView = (UIView *)container;
+    } else if ([container isKindOfClass:[UIViewController class]]) {
+        startView = ((UIViewController *)container).view;
+    }
+    if (!startView) {
+        return @[];
+    }
+
+    NSMutableArray *resultViews = [NSMutableArray array];
+    [self _traverseViewHierarchyByClassName:startView
+                               nameFragment:nameFragment
+                                usingBlock:^BOOL(UIView *foundView) {
+                                  [resultViews addObject:foundView];
+                                  return NO;
+                                }];
+
+    return [resultViews copy];
+}
+
 + (__kindof UIView *)findSubviewOfClass:(Class)targetClass inContainer:(id)container {
     if (!targetClass || !container) {
         return nil;
@@ -2124,6 +2150,33 @@ static os_unfair_lock _staticColorCreationLock = OS_UNFAIR_LOCK_INIT;
 
     for (UIView *subview in view.subviews) {
         if ([self _traverseViewHierarchy:subview forClass:targetClass usingBlock:block]) {
+            return YES;
+        }
+    }
+
+    return NO;
+}
+
+/**
+ * @brief 私有辅助方法：按运行时类名片段遍历视图层级。
+ * @param view 要遍历的根视图。
+ * @param nameFragment 要匹配的类名片段。
+ * @param block 找到匹配视图时执行的回调。返回 YES 可立即中止遍历。
+ * @return 如果遍历被中止，则返回 YES。
+ */
++ (BOOL)_traverseViewHierarchyByClassName:(UIView *)view nameFragment:(NSString *)nameFragment usingBlock:(BOOL (^)(UIView *foundView))block {
+    if (!view || !nameFragment.length || !block) {
+        return NO;
+    }
+
+    if ([NSStringFromClass([view class]) containsString:nameFragment]) {
+        if (block(view)) {
+            return YES;
+        }
+    }
+
+    for (UIView *subview in view.subviews) {
+        if ([self _traverseViewHierarchyByClassName:subview nameFragment:nameFragment usingBlock:block]) {
             return YES;
         }
     }

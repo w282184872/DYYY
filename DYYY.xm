@@ -3380,7 +3380,9 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
 
 %new
 - (void)applyBlurEffectIfNeeded {
-    if (DYYYGetBool(@"DYYYEnableCommentBlur") && [self isKindOfClass:NSClassFromString(@"AWECommentPanelContainerSwiftImpl.CommentContainerInnerViewController")]) {
+    // 抖音 40.2.0 起面板类 ObjC 注册名变为 _TtC28AWECommentPanelContainerSwiftImpl35CommentContainerInnerViewController，
+    // NSClassFromString 旧全名返回 nil，改用类名片段匹配以兼容旧版与新版。
+    if (DYYYGetBool(@"DYYYEnableCommentBlur") && [NSStringFromClass([self class]) containsString:@"CommentContainerInnerViewController"]) {
         // 动态获取用户设置的透明度
         float userTransparency = [[[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYCommentBlurTransparent"] floatValue];
         if (userTransparency <= 0 || userTransparency > 1) {
@@ -11192,7 +11194,13 @@ static Class tabBarButtonClass = nil;
         return;
 
     Class containerViewClass = NSClassFromString(@"AWECommentInputViewSwiftImpl.CommentInputContainerView");
-    NSArray<UIView *> *containerViews = [DYYYUtils findAllSubviewsOfClass:containerViewClass inContainer:self.view];
+    NSArray<UIView *> *containerViews = nil;
+    if (containerViewClass) {
+        containerViews = [DYYYUtils findAllSubviewsOfClass:containerViewClass inContainer:self.view];
+    } else {
+        // 抖音 40.2.0+ 该类 ObjC 注册名变更/移除，按运行时类名片段扫描兜底
+        containerViews = [DYYYUtils findAllSubviewsWithClassNameContaining:@"CommentInputContainerView" inContainer:self.view];
+    }
     for (UIView *containerView in containerViews) {
         for (UIView *subview in containerView.subviews) {
             if (subview.hidden == NO && subview.backgroundColor && CGColorGetAlpha(subview.backgroundColor.CGColor) == 1) {
@@ -11206,7 +11214,13 @@ static Class tabBarButtonClass = nil;
     }
 
     Class middleContainerClass = NSClassFromString(@"AWECommentInputViewSwiftImpl.CommentInputViewMiddleContainer");
-    NSArray<UIView *> *middleContainers = [DYYYUtils findAllSubviewsOfClass:middleContainerClass inContainer:self.view];
+    NSArray<UIView *> *middleContainers = nil;
+    if (middleContainerClass) {
+        middleContainers = [DYYYUtils findAllSubviewsOfClass:middleContainerClass inContainer:self.view];
+    } else {
+        // 抖音 40.2.0+ 该类 ObjC 注册名变更/移除，按运行时类名片段扫描兜底
+        middleContainers = [DYYYUtils findAllSubviewsWithClassNameContaining:@"CommentInputViewMiddleContainer" inContainer:self.view];
+    }
     for (UIView *middleContainer in middleContainers) {
         BOOL containsDanmu = NO;
         for (UIView *innerSubviewCheck in middleContainer.subviews) {
@@ -13191,5 +13205,517 @@ static void findTargetViewInView(UIView *view) {
                                                           }
                                                       }
                                                     }];
+    }
+}
+
+// ==================== 评论区毛玻璃 40.2.0 动态修复（面板级） ====================
+// 背景：40.2.0 面板 VC 的 ObjC 注册名为 _TtC28AWECommentPanelContainerSwiftImpl35CommentContainerInnerViewController，
+// 父类 AWEBaseListViewController 上的 viewDidLayoutSubviews hook 在 Swift 子类 override 时不会触发；
+// 且面板白底可能位于深层子视图，需递归清背景后叠加 UIVisualEffectView。
+static BOOL dyyyBlurPanelSwizzled = NO;
+static IMP dyyyOrigPanelViewDidLayoutSubviews = NULL;
+
+static Class dyyyClassByNameFragment(NSString *fragment) {
+    if (fragment.length == 0) return nil;
+    int count = objc_getClassList(NULL, 0);
+    Class *buffer = (Class *)malloc(sizeof(Class) * (size_t)count);
+    if (!buffer) return nil;
+    int actualCount = objc_getClassList(buffer, count);
+    Class result = nil;
+    for (int i = 0; i < actualCount; i++) {
+        Class c = buffer[i];
+        NSString *className = NSStringFromClass(c);
+        if ([className containsString:fragment]) {
+            result = c;
+            break;
+        }
+    }
+    free(buffer);
+    return result;
+}
+
+static void dyyyPanelApplyBlurIfNeeded(id panelVC) {
+    if (!panelVC) return;
+    if (!DYYYGetBool(@"DYYYEnableCommentBlur")) return;
+    if (![NSStringFromClass([panelVC class]) containsString:@"CommentContainerInnerViewController"]) return;
+
+    UIView *panelView = ((UIViewController *)panelVC).view;
+    if (!panelView) return;
+
+    float userTransparency = [[[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYCommentBlurTransparent"] floatValue];
+    if (userTransparency <= 0 || userTransparency > 1) {
+        userTransparency = 0.9;
+    }
+
+    // 递归清掉深层子视图的不透明背景，露出底层视频
+    [DYYYUtils clearBackgroundRecursivelyInView:panelView];
+    [DYYYUtils applyBlurEffectToView:panelView transparency:userTransparency blurViewTag:999];
+}
+
+// ===== 诊断：底部输入栏白底来源定位（debug 专用） =====
+static BOOL dyyyDiagBlurInputDone = NO;
+
+static NSString *dyyyDiagClassName(id obj) {
+    return obj ? NSStringFromClass([obj class]) : @"nil";
+}
+
+static NSString *dyyyDiagColorDesc(UIColor *color) {
+    if (!color) return @"nil";
+    CGColorSpaceRef space = CGColorGetColorSpace(color.CGColor);
+    NSString *alpha = [NSString stringWithFormat:@"a%.2f", CGColorGetAlpha(color.CGColor)];
+    if (CGColorSpaceGetModel(space) == kCGColorSpaceModelMonochrome) {
+        const CGFloat *c = CGColorGetComponents(color.CGColor);
+        return [NSString stringWithFormat:@"w%.2f %@", c[0], alpha];
+    }
+    if (CGColorSpaceGetModel(space) == kCGColorSpaceModelRGB) {
+        const CGFloat *c = CGColorGetComponents(color.CGColor);
+        return [NSString stringWithFormat:@"%.2f,%.2f,%.2f %@", c[0], c[1], c[2], alpha];
+    }
+    return @"?";
+}
+
+static NSString *dyyyDiagRectDesc(CGRect r) {
+    return [NSString stringWithFormat:@"(%.0f,%.0f,%.0fx%.0f)", r.origin.x, r.origin.y, r.size.width, r.size.height];
+}
+
+// 递归查找包含指定文本的 UILabel（限两层内输入框相关容器优先，找不到则全树）
+static void dyyyDiagFindLabel(UIView *view, NSString *text, UILabel **outLabel) {
+    if (*outLabel) return;
+    if ([view isKindOfClass:[UILabel class]]) {
+        NSString *t = ((UILabel *)view).text;
+        if (t && [t containsString:text]) { *outLabel = (UILabel *)view; return; }
+    }
+    for (UIView *sub in view.subviews) {
+        dyyyDiagFindLabel(sub, text, outLabel);
+        if (*outLabel) return;
+    }
+}
+
+// 打印某视图向上 8 层祖先链，标注是否经过 panelView、是否存在 tag999 毛玻璃
+static void dyyyDiagDumpAncestry(UIView *leaf, UIView *panelView, NSMutableString *report, NSString *tag) {
+    UIView *cur = leaf;
+    for (int i = 0; cur && i < 8; i++) {
+        BOOL isEffect = [cur isKindOfClass:[UIVisualEffectView class]];
+        BOOL isPanel = (cur == panelView);
+        NSString *indent = (i == 0) ? tag : @"  ↑  ";
+        NSString *suffix = @"";
+        if (isPanel) suffix = @"  <== PANEL";
+        else if (i == 0) suffix = [NSString stringWithFormat:@" inPanel=%d", [cur isDescendantOfView:panelView] ? 1 : 0];
+        [report appendFormat:@"\n  %@ L%d %@ frame=%@ bg=%@ alpha=%.2f opaque=%d hidden=%d effect=%d%@",
+            indent, i,
+            dyyyDiagClassName(cur), dyyyDiagRectDesc(cur.frame),
+            dyyyDiagColorDesc(cur.backgroundColor), cur.alpha, cur.opaque, cur.hidden,
+            isEffect, suffix];
+        if (isPanel) break;
+        cur = cur.superview;
+    }
+}
+
+// 统计子树内“仍不透明/可能制造白底”的视图
+static void dyyyDiagScanWhiteSources(UIView *view, NSMutableArray<UIView *> *effects, NSMutableArray<UIView *> *solids) {
+    if ([view isKindOfClass:[UIVisualEffectView class]]) [effects addObject:view];
+    else if (view.backgroundColor && CGColorGetAlpha(view.backgroundColor.CGColor) > 0.9) [solids addObject:view];
+    for (UIView *sub in view.subviews) {
+        dyyyDiagScanWhiteSources(sub, effects, solids);
+    }
+}
+
+static void dyyyDiagDoReport(id panelVC) {
+    UIView *panelView = ((UIViewController *)panelVC).view;
+    if (!panelView) return;
+    NSMutableString *report = [NSMutableString string];
+    [report appendFormat:@"[DYYY-DIAG] panel=%@\nframe=%@", dyyyDiagClassName(panelView), dyyyDiagRectDesc(panelView.frame)];
+
+    // 1) 以“发条评论”占位文本定位输入栏
+    UILabel *phLabel = nil;
+    dyyyDiagFindLabel(panelView, @"发条评论", &phLabel);
+    [report appendString:@"\n\n== 输入框占位文本链 =="];
+    if (phLabel) {
+        dyyyDiagDumpAncestry(phLabel, panelView, report, @"input");
+    } else {
+        [report appendString:@"\n  panelView 内未找到“发条评论”文本，改用类名片段查找"];
+        NSArray *inputViews = [DYYYUtils findAllSubviewsWithClassNameContaining:@"CommentInputContainerView" inContainer:panelView];
+        if (!inputViews.count) {
+            inputViews = [DYYYUtils findAllSubviewsWithClassNameContaining:@"CommentInputView" inContainer:panelView];
+        }
+        if (inputViews.count) {
+            dyyyDiagDumpAncestry(inputViews.firstObject, panelView, report, @"cls");
+        } else {
+            [report appendString:@"\n  panelView 内也未找到 CommentInput* 类"];
+        }
+    }
+
+    // 2) 全树统计不透明来源
+    NSMutableArray *effects = [NSMutableArray array];
+    NSMutableArray *solids = [NSMutableArray array];
+    dyyyDiagScanWhiteSources(panelView, effects, solids);
+    [report appendString:@"\n\n== 全树白底来源统计 =="];
+    [report appendFormat:@"\n  UIVisualEffectView 残留: %lu 个", (unsigned long)effects.count];
+    int shown = 0;
+    for (UIView *ev in effects) {
+        if (shown >= 3) break;
+        [report appendFormat:@"\n    effect %@ frame=%@ alpha=%.2f", dyyyDiagClassName(ev), dyyyDiagRectDesc(ev.frame), ev.alpha];
+        shown++;
+    }
+    shown = 0;
+    for (UIView *sv in solids) {
+        if (shown >= 5) break;
+        [report appendFormat:@"\n    solid %@ frame=%@ bg=%@", dyyyDiagClassName(sv), dyyyDiagRectDesc(sv.frame), dyyyDiagColorDesc(sv.backgroundColor)];
+        shown++;
+    }
+    if (!solids.count && !effects.count) {
+        [report appendString:@"\n  (无残留：白底可能来自 panelView 之外或 drawRect/图层内容)"];
+    }
+
+    // 3) 全屏 overlay 展示 15 秒，便于截图回传
+    NSLog(@"%@", report);
+    UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+    if (!keyWindow) keyWindow = [[UIApplication sharedApplication] windows].firstObject;
+    if (!keyWindow) return;
+    UIView *overlay = [[UIView alloc] initWithFrame:keyWindow.bounds];
+    overlay.backgroundColor = [UIColor colorWithWhite:0 alpha:0.88];
+    overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectInset(overlay.bounds, 14, 70)];
+    tv.backgroundColor = [UIColor clearColor];
+    tv.textColor = [UIColor whiteColor];
+    tv.font = [UIFont systemFontOfSize:13];
+    tv.editable = NO;
+    tv.selectable = NO;
+    tv.text = report;
+    [overlay addSubview:tv];
+    [keyWindow addSubview:overlay];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [overlay removeFromSuperview];
+    });
+}
+
+// ===== 2.2-9.5 评论区毛玻璃守护（修复 cell 复用白块 / 首帧白 / 下拉残留） =====
+// v3 一次性静态标志失效；v4 改面板生命周期守护（0.6s）；v5 在该基础上：
+// 1) viewWillAppear 挂窗前置于 layout 清首帧白；2) layout 完成后立即双通道清白底；
+// 3) 对评论 cell 类源头 swizzle layoutSubviews（cell 一布局即清，0 延迟）；
+// 4) 双通道清理 view.backgroundColor 与 layer.backgroundColor；非 tag999 近不透明 effect 摘材质；
+// 5) 守护间隔 0.6s -> 0.1s，滚动/下拉新建 cell 的可见窗口期趋近于 0。
+// 停止条件：面板视图脱离窗口（关闭/切走），解除守护标记，允许下次打开重新启动。
+static void *dyyyCommentGuardAssocKey = &dyyyCommentGuardAssocKey;
+
+static BOOL dyyyIsOpaqueWhiteBg(UIView *view) {
+    UIColor *bg = view.backgroundColor;
+    if (!bg) return NO;
+    size_t n = CGColorGetNumberOfComponents(bg.CGColor);
+    const CGFloat *c = CGColorGetComponents(bg.CGColor);
+    if (CGColorGetAlpha(bg.CGColor) < 0.9f) return NO;
+    if (n == 2) return c[0] >= 0.9f;
+    if (n >= 4) return c[0] >= 0.9f && c[1] >= 0.9f && c[2] >= 0.9f;
+    return NO;
+}
+
+// 深度优先找输入控件：优先“发条评论”占位文本，其次 UITextView/UITextField
+static UIView *dyyyFindInputLeafInView(UIView *view, UIView *skipView) {
+    if (view == nil || view == skipView) return nil;
+    if ([view isKindOfClass:[UILabel class]]) {
+        NSString *t = ((UILabel *)view).text;
+        if (t && [t rangeOfString:@"发条评论"].location != NSNotFound) return view;
+    }
+    if ([view isKindOfClass:[UITextView class]] || [view isKindOfClass:[UITextField class]]) return view;
+    for (UIView *sub in view.subviews) {
+        UIView *hit = dyyyFindInputLeafInView(sub, skipView);
+        if (hit) return hit;
+    }
+    return nil;
+}
+
+// 从输入控件向上找第一个纯白/UIVisualEffectView 宿主
+static UIView *dyyyWhiteHostAboveView(UIView *leaf) {
+    UIView *cur = leaf.superview;
+    int depth = 0;
+    while (cur && depth < 12) {
+        if ([cur isKindOfClass:[UIVisualEffectView class]] || dyyyIsOpaqueWhiteBg(cur)) return cur;
+        cur = cur.superview;
+        depth++;
+    }
+    return nil;
+}
+
+static void dyyyFixInputHost(UIView *host, NSMutableString *log) {
+    [log appendFormat:@" host=%@ frame=%@", NSStringFromClass([host class]), NSStringFromCGRect(host.frame)];
+    if ([host isKindOfClass:[UIVisualEffectView class]]) {
+        // 材质型白底：摘掉 effect 以露出面板层毛玻璃
+        ((UIVisualEffectView *)host).effect = nil;
+        [log appendString:@" ->effect=nil"];
+    } else {
+        host.backgroundColor = [UIColor clearColor];
+        host.opaque = NO;
+        [log appendString:@" ->bg=clear"];
+    }
+    // 宿主内部近白子容器一并清（避开文本/按钮类）
+    for (UIView *sub in host.subviews) {
+        if (![sub isKindOfClass:[UILabel class]] && dyyyIsOpaqueWhiteBg(sub)) {
+            sub.backgroundColor = [UIColor clearColor];
+            sub.opaque = NO;
+            [log appendFormat:@" |sub %@ clear", NSStringFromClass([sub class])];
+        }
+    }
+}
+
+// 输入栏宿主修复：幂等，可每轮安全重入；无输入控件/无白底/宿主不在底部区域时静默返回
+static BOOL dyyyFixInputBarIfNeeded(id panelVC) {
+    UIView *panelView = ((UIViewController *)panelVC).view;
+    if (!panelView) return NO;
+
+    UIView *inputLeaf = nil;
+    UIView *container = panelView.superview;
+    while (container && !inputLeaf) {
+        inputLeaf = dyyyFindInputLeafInView(container, panelView);
+        container = container.superview;
+    }
+    if (!inputLeaf) {
+        UIWindow *kw = [[UIApplication sharedApplication] keyWindow];
+        if (kw) inputLeaf = dyyyFindInputLeafInView(kw, panelView);
+    }
+    if (!inputLeaf) return NO;
+
+    UIView *host = dyyyWhiteHostAboveView(inputLeaf);
+    if (!host) return NO;
+
+    // 仅处理落在面板底部区域(输入栏)的宿主，避免误伤上部白色层
+    CGRect hf = host.frame;
+    if (hf.size.width < 1 || hf.size.height < 1 ||
+        CGRectGetMaxY(hf) < CGRectGetMaxY(panelView.frame) - 120.0f) {
+        return NO;
+    }
+
+    NSMutableString *log = [NSMutableString string];
+    [log appendString:@"[DYYY-INPUT]"];
+    [log appendFormat:@" leaf=%@", NSStringFromClass([inputLeaf class])];
+    dyyyFixInputHost(host, log);
+    // 日志节流：同一宿主被反复修复时不刷屏，最多 2 秒一条
+    static CFTimeInterval dyyyInputLastLog = 0;
+    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (now - dyyyInputLastLog > 2.0) {
+        NSLog(@"%@", log);
+        dyyyInputLastLog = now;
+    }
+    return YES;
+}
+
+// ===== 2.2-9.5 评论区毛玻璃彻底修复：双通道清白底 + cell 源头清理 + 挂窗前置于 viewWillAppear =====
+// 1) 双通道：同时清 view.backgroundColor 与 view.layer.backgroundColor（layer 直设背景是 SwiftUI/异步渲染常见白块来源）。
+// 2) tag999 是自身添加的毛玻璃层，整棵保留（含其 contentView 遮罩），避免误删。
+// 3) 非 tag999 的 UIVisualEffectView 若接近不透明（alpha>=0.85），判为材质型白块，摘 effect 露出下层。
+static BOOL dyyyCGColorIsWhiteish(CGColorRef cg) {
+    if (!cg) return NO;
+    CGColorSpaceRef space = CGColorGetColorSpace(cg);
+    if (!space) return NO;
+    CGColorSpaceModel model = CGColorGetColorSpaceModel(space);
+    const CGFloat *c = CGColorGetComponents(cg);
+    if (model == kCGColorSpaceModelMonochrome) return c[0] >= 0.9f;
+    if (model == kCGColorSpaceModelRGB) return (c[0] >= 0.9f && c[1] >= 0.9f && c[2] >= 0.9f);
+    return NO;
+}
+
+static void dyyyClearCommentWhiteTree(UIView *view) {
+    if (!view) return;
+    if (view.tag == 999) return; // 保留自身毛玻璃层整棵（含 contentView 遮罩）
+    if ([view isKindOfClass:[UIVisualEffectView class]]) {
+        UIVisualEffectView *ev = (UIVisualEffectView *)view;
+        if (view.alpha >= 0.85f) { // 近不透明材质 -> 白块来源，摘 effect
+            ev.effect = nil;
+            view.backgroundColor = [UIColor clearColor];
+            view.opaque = NO;
+        }
+        // 摘除后继续下钻清 contentView 内子视图
+    }
+    UIColor *bg = view.backgroundColor;
+    if (bg) {
+        CGColorRef cg = bg.CGColor;
+        if (CGColorGetAlpha(cg) >= 0.9f && dyyyCGColorIsWhiteish(cg)) {
+            view.backgroundColor = [UIColor clearColor];
+            view.opaque = NO;
+        }
+    }
+    CGColorRef layerBg = view.layer.backgroundColor;
+    if (layerBg) {
+        if (CGColorGetAlpha(layerBg) >= 0.9f && dyyyCGColorIsWhiteish(layerBg)) {
+            view.layer.backgroundColor = NULL;
+            view.opaque = NO;
+        }
+    }
+    for (UIView *sub in view.subviews) {
+        dyyyClearCommentWhiteTree(sub);
+    }
+}
+
+// ===== cell 级源头清理：对实际使用的评论 cell 类动态 swizzle layoutSubviews，一布局即清自身白底（0 延迟） =====
+static void *dyyyCellOrigIMPAssocKey = &dyyyCellOrigIMPAssocKey;
+static NSMutableSet *dyyySwizzledCellClasses = nil;
+
+static void dyyyCommentCellLayoutSubviewsSwizzled(id self, SEL _cmd) {
+    Class cls = object_getClass(self);
+    NSValue *val = objc_getAssociatedObject(cls, dyyyCellOrigIMPAssocKey);
+    IMP orig = val ? (IMP)[val pointerValue] : NULL;
+    if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
+    dyyyClearCommentWhiteTree(self); // 布局完成立即清白底，抢在渲染前
+}
+
+static void dyyySwizzleCommentCellOnce(Class cellClass) {
+    if (!cellClass) return;
+    if (![cellClass isSubclassOfClass:[UITableViewCell class]] &&
+        ![cellClass isSubclassOfClass:[UICollectionViewCell class]]) return;
+    if (!dyyySwizzledCellClasses) dyyySwizzledCellClasses = [NSMutableSet set];
+    NSString *clsName = NSStringFromClass(cellClass);
+    if (!clsName || [dyyySwizzledCellClasses containsObject:clsName]) return;
+
+    SEL layoutSel = @selector(layoutSubviews);
+    Method layoutMethod = class_getInstanceMethod(cellClass, layoutSel);
+    if (!layoutMethod) return;
+    IMP origIMP = method_getImplementation(layoutMethod);
+    const char *typeEncoding = method_getTypeEncoding(layoutMethod);
+    // 无论 cellClass 原本是否实现 layoutSubviews，都先把原 IMP 存好：
+    // 自身未实现（Method 来自父类）时 class_addMethod 直接成功后也要能回调父类原实现。
+    objc_setAssociatedObject(cellClass, dyyyCellOrigIMPAssocKey,
+                             [NSValue valueWithPointer:(const void *)origIMP], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    class_addMethod(cellClass, layoutSel, (IMP)dyyyCommentCellLayoutSubviewsSwizzled, typeEncoding);
+    Method currentMethod = class_getInstanceMethod(cellClass, layoutSel);
+    IMP currentIMP = method_getImplementation(currentMethod);
+    if (currentIMP != (IMP)dyyyCommentCellLayoutSubviewsSwizzled) {
+        method_setImplementation(currentMethod, (IMP)dyyyCommentCellLayoutSubviewsSwizzled);
+    }
+    [dyyySwizzledCellClasses addObject:clsName];
+    NSLog(@"[DYYY] comment cell swizzled: %@", clsName);
+}
+
+static void dyyyCollectCommentScrollViews(UIView *view, NSMutableArray *outArr) {
+    if (!view) return;
+    if ([view isKindOfClass:[UIScrollView class]]) { [outArr addObject:view]; return; } // 滚动容器内部不再下钻
+    for (UIView *sub in view.subviews) {
+        dyyyCollectCommentScrollViews(sub, outArr);
+    }
+}
+
+static void dyyyScanCommentCellsAndSwizzle(id panelVC) {
+    UIView *panelView = ((UIViewController *)panelVC).view;
+    if (!panelView) return;
+    NSMutableArray *scrolls = [NSMutableArray array];
+    dyyyCollectCommentScrollViews(panelView, scrolls);
+    for (UIView *sv in scrolls) {
+        NSArray *visibleCells = nil;
+        if ([sv isKindOfClass:[UITableView class]]) {
+            visibleCells = ((UITableView *)sv).visibleCells;
+        } else if ([sv isKindOfClass:[UICollectionView class]]) {
+            visibleCells = ((UICollectionView *)sv).visibleCells;
+        }
+        if (!visibleCells) continue;
+        for (UIView *cell in visibleCells) {
+            dyyySwizzleCommentCellOnce(object_getClass(cell));
+        }
+    }
+}
+
+// ===== 挂窗前置于 viewWillAppear：布局前的首帧白也拦截（守护由随后的 viewDidLayoutSubviews 启动） =====
+static IMP dyyyOrigPanelViewWillAppear = NULL;
+
+static void dyyyPanelViewWillAppearSwizzled(id self, SEL _cmd, BOOL animated) {
+    if (dyyyOrigPanelViewWillAppear) ((void (*)(id, SEL, BOOL))dyyyOrigPanelViewWillAppear)(self, _cmd, animated);
+    if (!DYYYGetBool(@"DYYYEnableCommentBlur")) return;
+    if (![NSStringFromClass([self class]) containsString:@"CommentContainerInnerViewController"]) return;
+    UIView *pv = ((UIViewController *)self).view;
+    if (pv) dyyyClearCommentWhiteTree(pv);
+    dyyyPanelApplyBlurIfNeeded(self);
+    dyyyFixInputBarIfNeeded(self);
+}
+
+// 单轮守护：幂等清理；面板视图已脱离窗口时返回 NO 以停止守护
+static BOOL dyyyCommentGuardTickOnce(id panelVC) {
+    UIView *panelView = ((UIViewController *)panelVC).view;
+    if (!panelView || !panelView.window) return NO;
+    dyyyScanCommentCellsAndSwizzle(panelVC); // 2.2-9.5: 收集可见 cell 并源头 swizzle（新复用 cell 类首次出现即挂 hook）
+    dyyyClearCommentWhiteTree(panelView);    // 2.2-9.5: 双通道清白底（backgroundColor + layer.backgroundColor）
+    dyyyPanelApplyBlurIfNeeded(panelVC);     // 面板树递归清白底 + 刷新/补建 tag999 毛玻璃（幂等）
+    dyyyFixInputBarIfNeeded(panelVC);        // 独立层级的输入栏宿主持续清理
+    return YES;
+}
+
+static void dyyyCommentGuardLoop(id panelVC) {
+    if (!dyyyCommentGuardTickOnce(panelVC)) {
+        objc_setAssociatedObject(panelVC, dyyyCommentGuardAssocKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dyyyCommentGuardLoop(panelVC);
+    });
+}
+
+// 启动守护：同一面板 VC 实例只启动一条循环链；面板关闭后关联标记被清除，可再次启动
+static void dyyyStartCommentGuard(id panelVC) {
+    if (!panelVC) return;
+    if (objc_getAssociatedObject(panelVC, dyyyCommentGuardAssocKey)) return;
+    UIView *pv = ((UIViewController *)panelVC).view;
+    if (!pv || !pv.window) return;
+    objc_setAssociatedObject(panelVC, dyyyCommentGuardAssocKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    dyyyCommentGuardLoop(panelVC);
+}
+
+static void dyyyPanelViewDidLayoutSubviewsSwizzled(id self, SEL _cmd) {
+    if (dyyyOrigPanelViewDidLayoutSubviews) {
+        ((void (*)(id, SEL))dyyyOrigPanelViewDidLayoutSubviews)(self, _cmd);
+    }
+    UIView *pv = ((UIViewController *)self).view;
+    if (pv) dyyyClearCommentWhiteTree(pv); // 2.2-9.5: layout 完成后立即双通道清白底（不等轮询）
+    dyyyPanelApplyBlurIfNeeded(self);
+    dyyyFixInputBarIfNeeded(self);
+    dyyyStartCommentGuard(self);
+}
+
+static void dyyyTrySwizzleBlurPanel(void) {
+    if (dyyyBlurPanelSwizzled) return;
+
+    Class panelClass = dyyyClassByNameFragment(@"CommentContainerInnerViewController");
+    if (!panelClass) return;
+
+    SEL layoutSel = @selector(viewDidLayoutSubviews);
+    Method layoutMethod = class_getInstanceMethod(panelClass, layoutSel);
+    if (!layoutMethod) return;
+
+    dyyyOrigPanelViewDidLayoutSubviews = method_getImplementation(layoutMethod);
+    const char *typeEncoding = method_getTypeEncoding(layoutMethod);
+
+    // 若 panelClass 自身没有实现 viewDidLayoutSubviews（Method 来自父类），先为它添加自己的实现，
+    // 保证替换只作用于目标面板类，不污染父类 AWEBaseListViewController 的其他子类。
+    class_addMethod(panelClass, layoutSel, (IMP)dyyyPanelViewDidLayoutSubviewsSwizzled, typeEncoding);
+    Method currentMethod = class_getInstanceMethod(panelClass, layoutSel);
+    IMP currentIMP = method_getImplementation(currentMethod);
+    if (currentIMP != (IMP)dyyyPanelViewDidLayoutSubviewsSwizzled) {
+        method_setImplementation(currentMethod, (IMP)dyyyPanelViewDidLayoutSubviewsSwizzled);
+    }
+
+    // 2.2-9.5: 同步挂 viewWillAppear，打开首帧即清白底+建毛玻璃（抢先于首次 layout 的白帧）
+    SEL appearSel = @selector(viewWillAppear:);
+    Method appearMethod = class_getInstanceMethod(panelClass, appearSel);
+    if (appearMethod) {
+        dyyyOrigPanelViewWillAppear = method_getImplementation(appearMethod);
+        const char *appearTypeEncoding = method_getTypeEncoding(appearMethod);
+        class_addMethod(panelClass, appearSel, (IMP)dyyyPanelViewWillAppearSwizzled, appearTypeEncoding);
+        Method currentAppearMethod = class_getInstanceMethod(panelClass, appearSel);
+        IMP currentAppearIMP = method_getImplementation(currentAppearMethod);
+        if (currentAppearIMP != (IMP)dyyyPanelViewWillAppearSwizzled) {
+            method_setImplementation(currentAppearMethod, (IMP)dyyyPanelViewWillAppearSwizzled);
+        }
+        NSLog(@"[DYYY] comment blur panel viewWillAppear swizzled");
+    }
+
+    dyyyBlurPanelSwizzled = YES;
+    NSLog(@"[DYYY] comment blur panel swizzled: %s", class_getName(panelClass));
+}
+
+%ctor {
+    // 面板类可能随业务库延迟注册，逐次延迟重试兜底
+    dyyyTrySwizzleBlurPanel();
+    if (!dyyyBlurPanelSwizzled) {
+        for (int i = 1; i <= 6; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                if (dyyyBlurPanelSwizzled) return;
+                dyyyTrySwizzleBlurPanel();
+            });
+        }
     }
 }

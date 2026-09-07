@@ -85,6 +85,16 @@ NS_ASSUME_NONNULL_BEGIN
  */
 + (BOOL)containsSubviewOfClass:(Class)targetClass inContainer:(id)container;
 
+/*
+ * @brief 查找指定控制器/视图层级中所有"运行时类名包含指定片段"的视图。
+ *        用于 Swift 类 ObjC 注册名发生 mangled/变更导致 NSClassFromString 取不到类的场景
+ *        （如抖音 40.2.0 评论区面板类注册名变为 _TtC28...CommentContainerInnerViewController）。
+ * @param nameFragment 要匹配的类名片段（大小写敏感）。
+ * @param container    要开始搜索的控制器或视图。
+ * @return 包含所有匹配视图的数组，如果未找到则返回空数组。
+ */
++ (NSArray<__kindof UIView *> *)findAllSubviewsWithClassNameContaining:(NSString *)nameFragment inContainer:(id)container;
+
 + (void)applyBlurEffectToView:(UIView *)view transparency:(float)userTransparency blurViewTag:(NSInteger)tag;
 + (void)clearBackgroundRecursivelyInView:(UIView *)view;
 

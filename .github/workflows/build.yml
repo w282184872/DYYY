@@ -1,4 +1,4 @@
-name: build deb
+name: 构建 deb
 
 on:
   push:
@@ -48,7 +48,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect build-relevant changes
+      - name: 检测本次改动是否与打包相关
         id: relevance
         env:
           PUSH_BEFORE: ${{ github.event.before }}
@@ -56,10 +56,10 @@ jobs:
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]] ||
              .github/scripts/build-relevance.sh range "$PUSH_BEFORE" "$GITHUB_SHA"; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "Build-relevant plugin, package, or Makefile changes detected."
+            echo "检测到插件源码、包配置或 Makefile 相关改动，开始打包。"
           else
             echo "should_build=false" >> "$GITHUB_OUTPUT"
-            echo "Only non-build Makefile settings changed; skipping Deb build."
+            echo "本次改动不影响 deb 构建（仅非构建性 Makefile 配置），跳过打包。"
           fi
 
   build:
@@ -73,18 +73,18 @@ jobs:
           submodules: true
           fetch-depth: 0
 
-      - name: Check cache
+      - name: 计算 Theos 上游缓存指纹
         run: |
           echo upstream_heads=`git ls-remote https://github.com/roothide/theos | head -n 1 | cut -f 1`-`git ls-remote https://github.com/theos/sdks | head -n 1 | cut -f 1` >> $GITHUB_ENV
 
-      - name: Use cache
+      - name: 命中 Theos 构建缓存
         id: cache
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/theos
           key: ${{ runner.os }}-${{ env.upstream_heads }}
 
-      - name: Remove unused Homebrew taps
+      - name: 移除无用的 Homebrew taps
         env:
           HOMEBREW_NO_REQUIRE_TAP_TRUST: "1"
           HOMEBREW_NO_AUTOREMOVE: "1"
@@ -98,51 +98,50 @@ jobs:
             fi
           done
 
-      - name: Prepare Theos
+      - name: 准备 Theos 工具链
         uses: huami1314/theos-action@main
 
-      - name: Setup GNU Make
+      - name: 配置 GNU Make
         run: |
           echo "$(brew --prefix)/opt/make/libexec/gnubin" >> $GITHUB_PATH
 
-      - name: Clean packages dir
+      - name: 清空打包输出目录
         run: rm -rf packages && mkdir -p packages
-        
-      - name: Build Rootful
+
+      - name: 构建 Rootful 包
         run: |
           make package FINALPACKAGE=1 -j$(sysctl -n hw.ncpu)
           for f in packages/*.deb; do
             [ -f "$f" ] && [[ "$f" != *"-root"*".deb" ]] && mv "$f" "${f%.deb}-rootful.deb"
           done
-             
-      - name: Build Rootless
+
+      - name: 构建 Rootless 包
         run: |
-          #make package FINALPACKAGE=1 -j$(sysctl -n hw.ncpu)
           make package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1 -j$(sysctl -n hw.ncpu)
           for f in packages/*.deb; do
             [ -f "$f" ] && [[ "$f" != *"-root"*".deb" ]] && mv "$f" "${f%.deb}-rootless.deb"
           done
-          
-      - name: Build Roothide
+
+      - name: 构建 Roothide 包
         run: |
           make package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1 -j$(sysctl -n hw.ncpu)
           for f in packages/*.deb; do
             [ -f "$f" ] && [[ "$f" != *"-root"*".deb" ]] && mv "$f" "${f%.deb}-roothide.deb"
           done
-          
-      - name: Prepare package metadata
+
+      - name: 读取包版本与时间戳
         id: package
         run: |
           timestamp=$(TZ=Asia/Shanghai date +%Y%m%d%H%M%S)
           version=$(awk -F': ' '$1 == "Version" { print $2; exit }' control)
           if [ -z "$version" ]; then
-            echo "Unable to read package version from control" >&2
+            echo "无法从 control 中读取包版本号" >&2
             exit 1
           fi
           echo "timestamp=$timestamp" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Verify Deb packages
+      - name: 校验三套 deb 产物
         shell: bash
         run: |
           set -euo pipefail
@@ -150,7 +149,7 @@ jobs:
 
           deb_files=(packages/*.deb)
           if [ "${#deb_files[@]}" -ne 3 ]; then
-            echo "Expected 3 Deb packages, found ${#deb_files[@]}:" >&2
+            echo "预期生成 3 个 deb 包，实际 ${#deb_files[@]} 个：" >&2
             printf '  %s\n' "${deb_files[@]}" >&2
             exit 1
           fi
@@ -158,19 +157,19 @@ jobs:
           for scheme in rootful rootless roothide; do
             scheme_files=(packages/*-"${scheme}".deb)
             if [ "${#scheme_files[@]}" -ne 1 ]; then
-              echo "Expected exactly one ${scheme} package, found ${#scheme_files[@]}" >&2
+              echo "预期恰好 1 个 ${scheme} 包，实际 ${#scheme_files[@]} 个" >&2
               exit 1
             fi
           done
 
-          printf 'Package artifact: %s\n' "${deb_files[@]}"
+          printf '打包产物: %s\n' "${deb_files[@]}"
 
-      - name: Extract arm64e dylib
+      - name: 提取 arm64e dylib
         env:
           PACKAGE_VERSION: ${{ steps.package.outputs.version }}
         run: .github/scripts/extract-release-dylib.sh
 
-      - name: Upload package artifacts
+      - name: 上传构建产物
         uses: actions/upload-artifact@v7
         with:
           name: DYYY-${{ steps.package.outputs.timestamp }}
