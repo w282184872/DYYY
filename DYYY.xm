@@ -13506,7 +13506,7 @@ static BOOL dyyyCGColorIsWhiteish(CGColorRef cg) {
     if (!cg) return NO;
     CGColorSpaceRef space = CGColorGetColorSpace(cg);
     if (!space) return NO;
-    CGColorSpaceModel model = CGColorGetColorSpaceModel(space);
+    CGColorSpaceModel model = CGColorSpaceGetModel(space);
     const CGFloat *c = CGColorGetComponents(cg);
     if (model == kCGColorSpaceModelMonochrome) return c[0] >= 0.9f;
     if (model == kCGColorSpaceModelRGB) return (c[0] >= 0.9f && c[1] >= 0.9f && c[2] >= 0.9f);
