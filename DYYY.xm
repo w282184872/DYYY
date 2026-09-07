@@ -3380,7 +3380,9 @@ static void DYYYDisableAVPlayerItemHDRMetadata(AVPlayerItem *item) {
 
 %new
 - (void)applyBlurEffectIfNeeded {
-    if (DYYYGetBool(@"DYYYEnableCommentBlur") && [self isKindOfClass:NSClassFromString(@"AWECommentPanelContainerSwiftImpl.CommentContainerInnerViewController")]) {
+    // 抖音 40.2.0 起面板类 ObjC 注册名变为 _TtC28AWECommentPanelContainerSwiftImpl35CommentContainerInnerViewController，
+    // NSClassFromString 旧全名返回 nil，改用类名片段匹配以兼容旧版与新版。
+    if (DYYYGetBool(@"DYYYEnableCommentBlur") && [NSStringFromClass([self class]) containsString:@"CommentContainerInnerViewController"]) {
         // 动态获取用户设置的透明度
         float userTransparency = [[[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYCommentBlurTransparent"] floatValue];
         if (userTransparency <= 0 || userTransparency > 1) {
@@ -11192,7 +11194,13 @@ static Class tabBarButtonClass = nil;
         return;
 
     Class containerViewClass = NSClassFromString(@"AWECommentInputViewSwiftImpl.CommentInputContainerView");
-    NSArray<UIView *> *containerViews = [DYYYUtils findAllSubviewsOfClass:containerViewClass inContainer:self.view];
+    NSArray<UIView *> *containerViews = nil;
+    if (containerViewClass) {
+        containerViews = [DYYYUtils findAllSubviewsOfClass:containerViewClass inContainer:self.view];
+    } else {
+        // 抖音 40.2.0+ 该类 ObjC 注册名变更/移除，按运行时类名片段扫描兜底
+        containerViews = [DYYYUtils findAllSubviewsWithClassNameContaining:@"CommentInputContainerView" inContainer:self.view];
+    }
     for (UIView *containerView in containerViews) {
         for (UIView *subview in containerView.subviews) {
             if (subview.hidden == NO && subview.backgroundColor && CGColorGetAlpha(subview.backgroundColor.CGColor) == 1) {
@@ -11206,7 +11214,13 @@ static Class tabBarButtonClass = nil;
     }
 
     Class middleContainerClass = NSClassFromString(@"AWECommentInputViewSwiftImpl.CommentInputViewMiddleContainer");
-    NSArray<UIView *> *middleContainers = [DYYYUtils findAllSubviewsOfClass:middleContainerClass inContainer:self.view];
+    NSArray<UIView *> *middleContainers = nil;
+    if (middleContainerClass) {
+        middleContainers = [DYYYUtils findAllSubviewsOfClass:middleContainerClass inContainer:self.view];
+    } else {
+        // 抖音 40.2.0+ 该类 ObjC 注册名变更/移除，按运行时类名片段扫描兜底
+        middleContainers = [DYYYUtils findAllSubviewsWithClassNameContaining:@"CommentInputViewMiddleContainer" inContainer:self.view];
+    }
     for (UIView *middleContainer in middleContainers) {
         BOOL containsDanmu = NO;
         for (UIView *innerSubviewCheck in middleContainer.subviews) {
