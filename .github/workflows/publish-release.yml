@@ -1,17 +1,16 @@
-name: publish release
+name: 发布 GitHub Release
 
 on:
+  # 每次「构建 deb」工作流成功完成后自动触发发布（不再限制 main 分支，任意分支构建成功都会发布）
   workflow_run:
     workflows:
-      - build deb
+      - 构建 deb
     types:
       - completed
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       source_run_id:
-        description: '来源 build run ID（含 artifact 的那次 Actions run）'
+        description: '来源构建 run ID（含 artifact 的那次 Actions run）'
         required: true
         type: string
       artifact_name:
@@ -20,7 +19,7 @@ on:
         type: string
         default: ''
       skip_cooldown:
-        description: '跳过 12 小时 Release 冷却'
+        description: '跳过 12 小时 Release 冷却（当前默认跳过）'
         required: false
         type: boolean
         default: true
@@ -44,7 +43,7 @@ jobs:
       artifact_name: ${{ steps.resolve.outputs.artifact_name }}
 
     steps:
-      - name: Resolve source run metadata
+      - name: 解析来源构建信息
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
@@ -56,14 +55,14 @@ jobs:
           run_json=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}")
           workflow_path=$(jq -r '.path' <<< "$run_json")
           if [[ "$workflow_path" != ".github/workflows/build.yml" ]]; then
-            echo "Run ${SOURCE_RUN_ID} belongs to ${workflow_path}, not build.yml" >&2
+            echo "Run ${SOURCE_RUN_ID} 属于 ${workflow_path}，并非 build.yml" >&2
             exit 1
           fi
 
           status=$(jq -r '.status' <<< "$run_json")
           conclusion=$(jq -r '.conclusion // empty' <<< "$run_json")
           if [[ "$status" != "completed" || "$conclusion" != "success" ]]; then
-            echo "Build run ${SOURCE_RUN_ID} is ${status}/${conclusion:-unknown}; only successful completed runs can be published." >&2
+            echo "构建 run ${SOURCE_RUN_ID} 状态为 ${status}/${conclusion:-unknown}，仅成功完成的构建才会发布。" >&2
             exit 1
           fi
 
@@ -82,16 +81,16 @@ jobs:
           if [[ -z "$artifact_name" || "$artifact_name" == "null" ]]; then
             if [[ "$GITHUB_EVENT_NAME" == "workflow_run" ]]; then
               echo "has_artifact=false" >> "$GITHUB_OUTPUT"
-              echo "Build run ${SOURCE_RUN_ID} produced no artifact; nothing to publish."
+              echo "构建 run ${SOURCE_RUN_ID} 未产出 artifact，无需发布。"
               exit 0
             fi
-            echo "Unable to resolve artifact name for run ${SOURCE_RUN_ID}" >&2
+            echo "无法解析 run ${SOURCE_RUN_ID} 的 artifact 名称" >&2
             exit 1
           fi
 
           echo "has_artifact=true" >> "$GITHUB_OUTPUT"
           echo "artifact_name=${artifact_name}" >> "$GITHUB_OUTPUT"
-          echo "Using artifact: ${artifact_name}"
+          echo "使用 artifact: ${artifact_name}"
 
   publish:
     needs: source
@@ -103,14 +102,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download release package artifacts
+      - name: 下载发布用构建产物
         uses: actions/download-artifact@v4
         with:
           name: ${{ needs.source.outputs.artifact_name }}
           run-id: ${{ needs.source.outputs.run_id }}
           github-token: ${{ github.token }}
 
-      - name: Prepare packages directory
+      - name: 整理 packages 目录
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -124,15 +123,15 @@ jobs:
 
           deb_files=(packages/*.deb)
           if [ "${#deb_files[@]}" -eq 0 ]; then
-            echo "No .deb files found after downloading artifact" >&2
+            echo "下载 artifact 后未找到 .deb 文件" >&2
             find . -maxdepth 3 -type f | sed 's/^/  /'
             exit 1
           fi
 
-          printf 'Downloaded release assets:\n'
+          printf '已下载的发布资源:\n'
           printf '  %s\n' packages/*
 
-      - name: Prepare release metadata
+      - name: 生成发布版本信息
         id: release
         env:
           BUILD_RUN_NUMBER: ${{ needs.source.outputs.run_number }}
@@ -144,7 +143,7 @@ jobs:
           fi
           version=$(git show "${SOURCE_HEAD_SHA}:control" | awk -F': ' '$1 == "Version" { print $2; exit }')
           if [ -z "$version" ]; then
-            echo "Unable to read package version from ${SOURCE_HEAD_SHA}:control" >&2
+            echo "无法从 ${SOURCE_HEAD_SHA}:control 读取包版本号" >&2
             exit 1
           fi
           release_name="DYYY_${version}#${BUILD_RUN_NUMBER}"
@@ -152,7 +151,7 @@ jobs:
           echo "tag=$release_name" >> "$GITHUB_OUTPUT"
           echo "title=$release_name" >> "$GITHUB_OUTPUT"
 
-      - name: Verify release assets
+      - name: 校验发布资源
         shell: bash
         run: |
           set -euo pipefail
@@ -161,12 +160,12 @@ jobs:
           deb_files=(packages/*.deb)
           dylib_files=(packages/*.dylib)
           if [ "${#deb_files[@]}" -ne 3 ]; then
-            echo "Expected 3 Deb packages, found ${#deb_files[@]}:" >&2
+            echo "预期 3 个 deb 包，实际 ${#deb_files[@]} 个:" >&2
             printf '  %s\n' "${deb_files[@]}" >&2
             exit 1
           fi
           if [ "${#dylib_files[@]}" -ne 1 ]; then
-            echo "Expected 1 dylib, found ${#dylib_files[@]}:" >&2
+            echo "预期 1 个 dylib，实际 ${#dylib_files[@]} 个:" >&2
             printf '  %s\n' "${dylib_files[@]}" >&2
             exit 1
           fi
@@ -174,14 +173,14 @@ jobs:
           for scheme in rootful rootless roothide; do
             scheme_files=(packages/*-"${scheme}".deb)
             if [ "${#scheme_files[@]}" -ne 1 ]; then
-              echo "Expected exactly one ${scheme} package, found ${#scheme_files[@]}" >&2
+              echo "预期恰好 1 个 ${scheme} 包，实际 ${#scheme_files[@]} 个" >&2
               exit 1
             fi
           done
 
-          printf 'Release asset: %s\n' "${deb_files[@]}" "${dylib_files[@]}"
+          printf '发布资源: %s\n' "${deb_files[@]}" "${dylib_files[@]}"
 
-      - name: Coordinate Release publication
+      - name: 协调 Release 发布
         id: release_gate
         env:
           GH_TOKEN: ${{ github.token }}
@@ -192,14 +191,16 @@ jobs:
           SOURCE_BUILD_BRANCH: ${{ needs.source.outputs.head_branch }}
           SKIP_COOLDOWN: ${{ inputs.skip_cooldown }}
         run: |
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$SKIP_COOLDOWN" == "true" ]]; then
+          # 自动触发的每次构建都应发布，因此 workflow_run 与手动跳过冷却时都不做 12 小时间隔限制
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_run" ]] || \
+             [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$SKIP_COOLDOWN" == "true" ]]; then
             export RELEASE_MIN_INTERVAL_SECONDS=0
           else
             export RELEASE_MIN_INTERVAL_SECONDS=43200
           fi
           .github/scripts/release-coordinator.sh
 
-      - name: Resolve safe Release target
+      - name: 确认安全的 Release 目标
         id: release_target
         if: steps.release_gate.outputs.should_publish == 'true'
         env:
@@ -209,7 +210,7 @@ jobs:
           set -euo pipefail
 
           if [[ -z "$SOURCE_BUILD_BRANCH" || "$SOURCE_BUILD_BRANCH" == "null" ]]; then
-            echo "Source build run has no branch; unable to create a Release tag safely." >&2
+            echo "来源构建 run 无分支信息，无法安全创建 Release 标签。" >&2
             exit 1
           fi
 
@@ -219,22 +220,22 @@ jobs:
             "refs/remotes/origin/${SOURCE_BUILD_BRANCH}^{commit}")
 
           if ! git merge-base --is-ancestor "$SOURCE_BUILD_SHA" "$target_sha"; then
-            echo "Source build ${SOURCE_BUILD_SHA} is not an ancestor of ${SOURCE_BUILD_BRANCH} (${target_sha})." >&2
+            echo "来源构建 ${SOURCE_BUILD_SHA} 不是 ${SOURCE_BUILD_BRANCH}(${target_sha}) 的祖先提交。" >&2
             exit 1
           fi
 
           if [[ "$SOURCE_BUILD_SHA" != "$target_sha" ]] &&
              .github/scripts/build-relevance.sh range "$SOURCE_BUILD_SHA" "$target_sha"; then
-            echo "A newer build-relevant change reached ${SOURCE_BUILD_BRANCH}; this run will not publish a Release."
+            echo "${SOURCE_BUILD_BRANCH} 上已有更新的构建相关改动，本次不再发布。"
             echo "should_publish=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "Release tag will target ${SOURCE_BUILD_BRANCH} HEAD: ${target_sha}"
+          echo "Release 标签将指向 ${SOURCE_BUILD_BRANCH} 的最新提交: ${target_sha}"
           echo "should_publish=true" >> "$GITHUB_OUTPUT"
           echo "sha=${target_sha}" >> "$GITHUB_OUTPUT"
 
-      - name: Generate release notes
+      - name: 生成更新日志
         if: >-
           steps.release_gate.outputs.should_publish == 'true' &&
           steps.release_target.outputs.should_publish == 'true'
@@ -244,7 +245,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: .github/scripts/generate-release-notes.sh
 
-      - name: Publish GitHub Release
+      - name: 发布 GitHub Release
         if: >-
           steps.release_gate.outputs.should_publish == 'true' &&
           steps.release_target.outputs.should_publish == 'true'
