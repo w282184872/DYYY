@@ -13252,11 +13252,158 @@ static void dyyyPanelApplyBlurIfNeeded(id panelVC) {
     [DYYYUtils applyBlurEffectToView:panelView transparency:userTransparency blurViewTag:999];
 }
 
+// ===== 诊断：底部输入栏白底来源定位（debug 专用） =====
+static BOOL dyyyDiagBlurInputDone = NO;
+
+static NSString *dyyyDiagClassName(id obj) {
+    return obj ? NSStringFromClass([obj class]) : @"nil";
+}
+
+static NSString *dyyyDiagColorDesc(UIColor *color) {
+    if (!color) return @"nil";
+    CGColorSpaceRef space = CGColorGetColorSpace(color.CGColor);
+    NSString *alpha = [NSString stringWithFormat:@"a%.2f", CGColorGetAlpha(color.CGColor)];
+    if (CGColorSpaceGetModel(space) == kCGColorSpaceModelMonochrome) {
+        const CGFloat *c = CGColorGetComponents(color.CGColor);
+        return [NSString stringWithFormat:@"w%.2f %@", c[0], alpha];
+    }
+    if (CGColorSpaceGetModel(space) == kCGColorSpaceModelRGB) {
+        const CGFloat *c = CGColorGetComponents(color.CGColor);
+        return [NSString stringWithFormat:@"%.2f,%.2f,%.2f %@", c[0], c[1], c[2], alpha];
+    }
+    return @"?";
+}
+
+static NSString *dyyyDiagRectDesc(CGRect r) {
+    return [NSString stringWithFormat:@"(%.0f,%.0f,%.0fx%.0f)", r.origin.x, r.origin.y, r.size.width, r.size.height];
+}
+
+// 递归查找包含指定文本的 UILabel（限两层内输入框相关容器优先，找不到则全树）
+static void dyyyDiagFindLabel(UIView *view, NSString *text, UILabel **outLabel) {
+    if (*outLabel) return;
+    if ([view isKindOfClass:[UILabel class]]) {
+        NSString *t = ((UILabel *)view).text;
+        if (t && [t containsString:text]) { *outLabel = (UILabel *)view; return; }
+    }
+    for (UIView *sub in view.subviews) {
+        dyyyDiagFindLabel(sub, text, outLabel);
+        if (*outLabel) return;
+    }
+}
+
+// 打印某视图向上 8 层祖先链，标注是否经过 panelView、是否存在 tag999 毛玻璃
+static void dyyyDiagDumpAncestry(UIView *leaf, UIView *panelView, NSMutableString *report, NSString *tag) {
+    UIView *cur = leaf;
+    for (int i = 0; cur && i < 8; i++) {
+        BOOL isEffect = [cur isKindOfClass:[UIVisualEffectView class]];
+        BOOL isPanel = (cur == panelView);
+        NSString *indent = (i == 0) ? tag : @"  ↑  ";
+        NSString *suffix = @"";
+        if (isPanel) suffix = @"  <== PANEL";
+        else if (i == 0) suffix = [NSString stringWithFormat:@" inPanel=%d", [cur isDescendantOfView:panelView] ? 1 : 0];
+        [report appendFormat:@"\n  %@ L%d %@ frame=%@ bg=%@ alpha=%.2f opaque=%d hidden=%d effect=%d%@",
+            indent, i,
+            dyyyDiagClassName(cur), dyyyDiagRectDesc(cur.frame),
+            dyyyDiagColorDesc(cur.backgroundColor), cur.alpha, cur.opaque, cur.hidden,
+            isEffect, suffix];
+        if (isPanel) break;
+        cur = cur.superview;
+    }
+}
+
+// 统计子树内“仍不透明/可能制造白底”的视图
+static void dyyyDiagScanWhiteSources(UIView *view, NSMutableArray<UIView *> *effects, NSMutableArray<UIView *> *solids) {
+    if ([view isKindOfClass:[UIVisualEffectView class]]) [effects addObject:view];
+    else if (view.backgroundColor && CGColorGetAlpha(view.backgroundColor.CGColor) > 0.9) [solids addObject:view];
+    for (UIView *sub in view.subviews) {
+        dyyyDiagScanWhiteSources(sub, effects, solids);
+    }
+}
+
+static void dyyyDiagDoReport(id panelVC) {
+    UIView *panelView = ((UIViewController *)panelVC).view;
+    if (!panelView) return;
+    NSMutableString *report = [NSMutableString string];
+    [report appendFormat:@"[DYYY-DIAG] panel=%@\nframe=%@", dyyyDiagClassName(panelView), dyyyDiagRectDesc(panelView.frame)];
+
+    // 1) 以“发条评论”占位文本定位输入栏
+    UILabel *phLabel = nil;
+    dyyyDiagFindLabel(panelView, @"发条评论", &phLabel);
+    [report appendString:@"\n\n== 输入框占位文本链 =="];
+    if (phLabel) {
+        dyyyDiagDumpAncestry(phLabel, panelView, report, @"input");
+    } else {
+        [report appendString:@"\n  panelView 内未找到“发条评论”文本，改用类名片段查找"];
+        NSArray *inputViews = [DYYYUtils findAllSubviewsWithClassNameContaining:@"CommentInputContainerView" inContainer:panelView];
+        if (!inputViews.count) {
+            inputViews = [DYYYUtils findAllSubviewsWithClassNameContaining:@"CommentInputView" inContainer:panelView];
+        }
+        if (inputViews.count) {
+            dyyyDiagDumpAncestry(inputViews.firstObject, panelView, report, @"cls");
+        } else {
+            [report appendString:@"\n  panelView 内也未找到 CommentInput* 类"];
+        }
+    }
+
+    // 2) 全树统计不透明来源
+    NSMutableArray *effects = [NSMutableArray array];
+    NSMutableArray *solids = [NSMutableArray array];
+    dyyyDiagScanWhiteSources(panelView, effects, solids);
+    [report appendString:@"\n\n== 全树白底来源统计 =="];
+    [report appendFormat:@"\n  UIVisualEffectView 残留: %lu 个", (unsigned long)effects.count];
+    int shown = 0;
+    for (UIView *ev in effects) {
+        if (shown >= 3) break;
+        [report appendFormat:@"\n    effect %@ frame=%@ alpha=%.2f", dyyyDiagClassName(ev), dyyyDiagRectDesc(ev.frame), ev.alpha];
+        shown++;
+    }
+    shown = 0;
+    for (UIView *sv in solids) {
+        if (shown >= 5) break;
+        [report appendFormat:@"\n    solid %@ frame=%@ bg=%@", dyyyDiagClassName(sv), dyyyDiagRectDesc(sv.frame), dyyyDiagColorDesc(sv.backgroundColor)];
+        shown++;
+    }
+    if (!solids.count && !effects.count) {
+        [report appendString:@"\n  (无残留：白底可能来自 panelView 之外或 drawRect/图层内容)"];
+    }
+
+    // 3) 全屏 overlay 展示 15 秒，便于截图回传
+    NSLog(@"%@", report);
+    UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+    if (!keyWindow) keyWindow = [[UIApplication sharedApplication] windows].firstObject;
+    if (!keyWindow) return;
+    UIView *overlay = [[UIView alloc] initWithFrame:keyWindow.bounds];
+    overlay.backgroundColor = [UIColor colorWithWhite:0 alpha:0.88];
+    overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectInset(overlay.bounds, 14, 70)];
+    tv.backgroundColor = [UIColor clearColor];
+    tv.textColor = [UIColor whiteColor];
+    tv.font = [UIFont systemFontOfSize:13];
+    tv.editable = NO;
+    tv.selectable = NO;
+    tv.text = report;
+    [overlay addSubview:tv];
+    [keyWindow addSubview:overlay];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [overlay removeFromSuperview];
+    });
+}
+
+static void dyyyTryDiagnoseInputArea(id panelVC) {
+    if (!DYYYGetBool(@"DYYYEnableCommentBlur")) return;
+    if (dyyyDiagBlurInputDone) return;
+    dyyyDiagBlurInputDone = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dyyyDiagDoReport(panelVC);
+    });
+}
+
 static void dyyyPanelViewDidLayoutSubviewsSwizzled(id self, SEL _cmd) {
     if (dyyyOrigPanelViewDidLayoutSubviews) {
         ((void (*)(id, SEL))dyyyOrigPanelViewDidLayoutSubviews)(self, _cmd);
     }
     dyyyPanelApplyBlurIfNeeded(self);
+    dyyyTryDiagnoseInputArea(self);
 }
 
 static void dyyyTrySwizzleBlurPanel(void) {
