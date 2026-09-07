@@ -13389,9 +13389,11 @@ static void dyyyDiagDoReport(id panelVC) {
     });
 }
 
-// ===== 2.2-9.3 输入栏宿主全局定位与清理（诊断降级为后台 log） =====
-static BOOL dyyyInputBarFixed = NO;
-static BOOL dyyyInputFixScheduled = NO;
+// ===== 2.2-9.4 评论区毛玻璃守护轮询（修复 cell 复用白块 / 切视频整白底） =====
+// v3 一次性静态标志在 cell 复用与切视频重置背景后失效；v4 改为面板存在期间持续守护：
+// 每 0.6s 幂等执行 1) 递归清面板树不透明白底 + 刷新/补建 tag999 毛玻璃；2) 清独立层级输入栏白底宿主。
+// 停止条件：面板视图脱离窗口（关闭/切走），解除守护标记，允许下次打开重新启动。
+static void *dyyyCommentGuardAssocKey = &dyyyCommentGuardAssocKey;
 
 static BOOL dyyyIsOpaqueWhiteBg(UIView *view) {
     UIColor *bg = view.backgroundColor;
@@ -13452,14 +13454,11 @@ static void dyyyFixInputHost(UIView *host, NSMutableString *log) {
     }
 }
 
-static void dyyyInputBarFixOnce(id panelVC) {
-    if (dyyyInputBarFixed) return;
+// 输入栏宿主修复：幂等，可每轮安全重入；无输入控件/无白底/宿主不在底部区域时静默返回
+static BOOL dyyyFixInputBarIfNeeded(id panelVC) {
     UIView *panelView = ((UIViewController *)panelVC).view;
-    if (!panelView) return;
-    NSMutableString *log = [NSMutableString string];
-    [log appendString:@"[DYYY-INPUT]"];
+    if (!panelView) return NO;
 
-    // 沿面板父链向上找容器，找不到再退回 keyWindow 全树
     UIView *inputLeaf = nil;
     UIView *container = panelView.superview;
     while (container && !inputLeaf) {
@@ -13470,48 +13469,59 @@ static void dyyyInputBarFixOnce(id panelVC) {
         UIWindow *kw = [[UIApplication sharedApplication] keyWindow];
         if (kw) inputLeaf = dyyyFindInputLeafInView(kw, panelView);
     }
-    if (!inputLeaf) {
-        [log appendString:@" 未定位到输入控件，稍后重试"];
-        NSLog(@"%@", log);
-        return;
-    }
-    [log appendFormat:@" leaf=%@ frame=%@", NSStringFromClass([inputLeaf class]), NSStringFromCGRect(inputLeaf.frame)];
+    if (!inputLeaf) return NO;
 
     UIView *host = dyyyWhiteHostAboveView(inputLeaf);
-    if (!host) {
-        [log appendString:@" 无白色宿主（输入栏已透明），标记完成"];
-        NSLog(@"%@", log);
-        dyyyInputBarFixed = YES;
-        return;
-    }
+    if (!host) return NO;
+
     // 仅处理落在面板底部区域(输入栏)的宿主，避免误伤上部白色层
     CGRect hf = host.frame;
     if (hf.size.width < 1 || hf.size.height < 1 ||
         CGRectGetMaxY(hf) < CGRectGetMaxY(panelView.frame) - 120.0f) {
-        [log appendString:@" 宿主不在面板底部区域，跳过并标记完成"];
-        NSLog(@"%@", log);
-        dyyyInputBarFixed = YES;
-        return;
+        return NO;
     }
+
+    NSMutableString *log = [NSMutableString string];
+    [log appendString:@"[DYYY-INPUT]"];
+    [log appendFormat:@" leaf=%@", NSStringFromClass([inputLeaf class])];
     dyyyFixInputHost(host, log);
-    dyyyInputBarFixed = YES;
-    NSLog(@"%@", log);
+    // 日志节流：同一宿主被反复修复时不刷屏，最多 2 秒一条
+    static CFTimeInterval dyyyInputLastLog = 0;
+    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (now - dyyyInputLastLog > 2.0) {
+        NSLog(@"%@", log);
+        dyyyInputLastLog = now;
+    }
+    return YES;
 }
 
-static void dyyyTryDiagnoseInputArea(id panelVC) {
-    if (!DYYYGetBool(@"DYYYEnableCommentBlur")) return;
-    if (dyyyInputBarFixed) return;
-    dyyyInputBarFixOnce(panelVC);
-    // 输入栏可能延迟挂载：未成功时在 0.5s~5s 窗口内逐步重试，只排一次队列
-    if (!dyyyInputBarFixed && !dyyyInputFixScheduled) {
-        dyyyInputFixScheduled = YES;
-        for (int i = 1; i <= 10; i++) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                if (dyyyInputBarFixed) return;
-                dyyyInputBarFixOnce(panelVC);
-            });
-        }
+// 单轮守护：幂等清理；面板视图已脱离窗口时返回 NO 以停止守护
+static BOOL dyyyCommentGuardTickOnce(id panelVC) {
+    UIView *panelView = ((UIViewController *)panelVC).view;
+    if (!panelView || !panelView.window) return NO;
+    dyyyPanelApplyBlurIfNeeded(panelVC);  // 面板树递归清白底 + 刷新/补建 tag999 毛玻璃（幂等）
+    dyyyFixInputBarIfNeeded(panelVC);     // 独立层级的输入栏宿主持续清理
+    return YES;
+}
+
+static void dyyyCommentGuardLoop(id panelVC) {
+    if (!dyyyCommentGuardTickOnce(panelVC)) {
+        objc_setAssociatedObject(panelVC, dyyyCommentGuardAssocKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return;
     }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dyyyCommentGuardLoop(panelVC);
+    });
+}
+
+// 启动守护：同一面板 VC 实例只启动一条循环链；面板关闭后关联标记被清除，可再次启动
+static void dyyyStartCommentGuard(id panelVC) {
+    if (!panelVC) return;
+    if (objc_getAssociatedObject(panelVC, dyyyCommentGuardAssocKey)) return;
+    UIView *pv = ((UIViewController *)panelVC).view;
+    if (!pv || !pv.window) return;
+    objc_setAssociatedObject(panelVC, dyyyCommentGuardAssocKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    dyyyCommentGuardLoop(panelVC);
 }
 
 static void dyyyPanelViewDidLayoutSubviewsSwizzled(id self, SEL _cmd) {
@@ -13519,7 +13529,8 @@ static void dyyyPanelViewDidLayoutSubviewsSwizzled(id self, SEL _cmd) {
         ((void (*)(id, SEL))dyyyOrigPanelViewDidLayoutSubviews)(self, _cmd);
     }
     dyyyPanelApplyBlurIfNeeded(self);
-    dyyyTryDiagnoseInputArea(self);
+    dyyyFixInputBarIfNeeded(self);
+    dyyyStartCommentGuard(self);
 }
 
 static void dyyyTrySwizzleBlurPanel(void) {
