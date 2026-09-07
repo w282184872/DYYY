@@ -13207,3 +13207,92 @@ static void findTargetViewInView(UIView *view) {
                                                     }];
     }
 }
+
+// ==================== 评论区毛玻璃 40.2.0 动态修复（面板级） ====================
+// 背景：40.2.0 面板 VC 的 ObjC 注册名为 _TtC28AWECommentPanelContainerSwiftImpl35CommentContainerInnerViewController，
+// 父类 AWEBaseListViewController 上的 viewDidLayoutSubviews hook 在 Swift 子类 override 时不会触发；
+// 且面板白底可能位于深层子视图，需递归清背景后叠加 UIVisualEffectView。
+static BOOL dyyyBlurPanelSwizzled = NO;
+static IMP dyyyOrigPanelViewDidLayoutSubviews = NULL;
+
+static Class dyyyClassByNameFragment(NSString *fragment) {
+    if (fragment.length == 0) return nil;
+    int count = objc_getClassList(NULL, 0);
+    Class *buffer = (Class *)malloc(sizeof(Class) * (size_t)count);
+    if (!buffer) return nil;
+    int actualCount = objc_getClassList(buffer, count);
+    Class result = nil;
+    for (int i = 0; i < actualCount; i++) {
+        Class c = buffer[i];
+        NSString *className = NSStringFromClass(c);
+        if ([className containsString:fragment]) {
+            result = c;
+            break;
+        }
+    }
+    free(buffer);
+    return result;
+}
+
+static void dyyyPanelApplyBlurIfNeeded(id panelVC) {
+    if (!panelVC) return;
+    if (!DYYYGetBool(@"DYYYEnableCommentBlur")) return;
+    if (![NSStringFromClass([panelVC class]) containsString:@"CommentContainerInnerViewController"]) return;
+
+    UIView *panelView = ((UIViewController *)panelVC).view;
+    if (!panelView) return;
+
+    float userTransparency = [[[NSUserDefaults standardUserDefaults] objectForKey:@"DYYYCommentBlurTransparent"] floatValue];
+    if (userTransparency <= 0 || userTransparency > 1) {
+        userTransparency = 0.9;
+    }
+
+    // 递归清掉深层子视图的不透明背景，露出底层视频
+    [DYYYUtils clearBackgroundRecursivelyInView:panelView];
+    [DYYYUtils applyBlurEffectToView:panelView transparency:userTransparency blurViewTag:999];
+}
+
+static void dyyyPanelViewDidLayoutSubviewsSwizzled(id self, SEL _cmd) {
+    if (dyyyOrigPanelViewDidLayoutSubviews) {
+        ((void (*)(id, SEL))dyyyOrigPanelViewDidLayoutSubviews)(self, _cmd);
+    }
+    dyyyPanelApplyBlurIfNeeded(self);
+}
+
+static void dyyyTrySwizzleBlurPanel(void) {
+    if (dyyyBlurPanelSwizzled) return;
+
+    Class panelClass = dyyyClassByNameFragment(@"CommentContainerInnerViewController");
+    if (!panelClass) return;
+
+    SEL layoutSel = @selector(viewDidLayoutSubviews);
+    Method layoutMethod = class_getInstanceMethod(panelClass, layoutSel);
+    if (!layoutMethod) return;
+
+    dyyyOrigPanelViewDidLayoutSubviews = method_getImplementation(layoutMethod);
+    const char *typeEncoding = method_getTypeEncoding(layoutMethod);
+
+    // 若 panelClass 自身没有实现 viewDidLayoutSubviews（Method 来自父类），先为它添加自己的实现，
+    // 保证替换只作用于目标面板类，不污染父类 AWEBaseListViewController 的其他子类。
+    class_addMethod(panelClass, layoutSel, (IMP)dyyyPanelViewDidLayoutSubviewsSwizzled, typeEncoding);
+    Method currentMethod = class_getInstanceMethod(panelClass, layoutSel);
+    IMP currentIMP = method_getImplementation(currentMethod);
+    if (currentIMP != (IMP)dyyyPanelViewDidLayoutSubviewsSwizzled) {
+        method_setImplementation(currentMethod, (IMP)dyyyPanelViewDidLayoutSubviewsSwizzled);
+    }
+    dyyyBlurPanelSwizzled = YES;
+    NSLog(@"[DYYY] comment blur panel swizzled: %s", class_getName(panelClass));
+}
+
+%ctor {
+    // 面板类可能随业务库延迟注册，逐次延迟重试兜底
+    dyyyTrySwizzleBlurPanel();
+    if (!dyyyBlurPanelSwizzled) {
+        for (int i = 1; i <= 6; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                if (dyyyBlurPanelSwizzled) return;
+                dyyyTrySwizzleBlurPanel();
+            });
+        }
+    }
+}
