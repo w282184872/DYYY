@@ -13552,7 +13552,7 @@ static NSMutableSet *dyyySwizzledCellClasses = nil;
 static void dyyyCommentCellLayoutSubviewsSwizzled(id self, SEL _cmd) {
     Class cls = object_getClass(self);
     NSValue *val = objc_getAssociatedObject(cls, dyyyCellOrigIMPAssocKey);
-    IMP orig = val ? [val pointerValue] : NULL;
+    IMP orig = val ? (IMP)[val pointerValue] : NULL;
     if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
     dyyyClearCommentWhiteTree(self); // 布局完成立即清白底，抢在渲染前
 }
@@ -13573,7 +13573,7 @@ static void dyyySwizzleCommentCellOnce(Class cellClass) {
     // 无论 cellClass 原本是否实现 layoutSubviews，都先把原 IMP 存好：
     // 自身未实现（Method 来自父类）时 class_addMethod 直接成功后也要能回调父类原实现。
     objc_setAssociatedObject(cellClass, dyyyCellOrigIMPAssocKey,
-                             [NSValue valueWithPointer:origIMP], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                             [NSValue valueWithPointer:(const void *)origIMP], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     class_addMethod(cellClass, layoutSel, (IMP)dyyyCommentCellLayoutSubviewsSwizzled, typeEncoding);
     Method currentMethod = class_getInstanceMethod(cellClass, layoutSel);
     IMP currentIMP = method_getImplementation(currentMethod);
