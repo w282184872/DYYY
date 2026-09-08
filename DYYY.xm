@@ -13633,137 +13633,6 @@ static void dyyyScanCommentCellsAndSwizzle(id panelVC) {
     }
 }
 
-// ===== v6 标题行白块根治：对反复出现白底的宿主类做 setter 级源头拦截 =====
-// 近白不透明 backgroundColor 在 set 时直接改 clear，白色再也设不进去，从机制上消灭"清完又白/闪烁"。
-static void *dyyyHostColorOrigIMPKey = &dyyyHostColorOrigIMPKey;   // setBackgroundColor: 原 IMP
-static void *dyyyHostEffectOrigIMPKey = &dyyyHostEffectOrigIMPKey; // setEffect: 原 IMP
-static NSMutableSet *dyyySwizzledHostColorClasses = nil;
-static NSMutableSet *dyyySwizzledHostEffectClasses = nil;
-
-static BOOL dyyyUIColorNearWhiteOpaque(UIColor *c) {
-    if (!c) return NO;
-    CGColorRef cg = c.CGColor;
-    return cg && CGColorGetAlpha(cg) >= 0.9f && dyyyCGColorIsWhiteish(cg);
-}
-
-static void dyyyHostSetBackgroundColorSwizzled(id self, SEL _cmd, UIColor *color) {
-    Class cls = object_getClass(self);
-    NSValue *val = objc_getAssociatedObject(cls, dyyyHostColorOrigIMPKey);
-    IMP orig = val ? (IMP)[val pointerValue] : NULL;
-    if (dyyyUIColorNearWhiteOpaque(color)) {
-        color = [UIColor clearColor];
-        ((UIView *)self).opaque = NO;
-        // 顺带清一次 layer 底色：layer.backgroundColor 的独立残留一并去掉
-        CGColorRef lc = ((UIView *)self).layer.backgroundColor;
-        if (lc && CGColorGetAlpha(lc) >= 0.9f && dyyyCGColorIsWhiteish(lc)) {
-            ((UIView *)self).layer.backgroundColor = NULL;
-        }
-    }
-    if (orig) ((void (*)(id, SEL, UIColor *))orig)(self, _cmd, color);
-}
-
-static void dyyyHostSetEffectSwizzled(id self, SEL _cmd, UIVisualEffect *effect) {
-    Class cls = object_getClass(self);
-    NSValue *val = objc_getAssociatedObject(cls, dyyyHostEffectOrigIMPKey);
-    IMP orig = val ? (IMP)[val pointerValue] : NULL;
-    // 非 tag999 宿主出现材质即摘除（宿主被识别即代表它当前呈现白块）
-    if (effect && ((UIView *)self).tag != 999) {
-        effect = nil;
-        ((UIView *)self).backgroundColor = [UIColor clearColor];
-        ((UIView *)self).opaque = NO;
-    }
-    if (orig) ((void (*)(id, SEL, UIVisualEffect *))orig)(self, _cmd, effect);
-}
-
-static void dyyySwizzleHostColorSetterOnce(Class cls) {
-    if (!cls) return;
-    if (!dyyySwizzledHostColorClasses) dyyySwizzledHostColorClasses = [NSMutableSet set];
-    NSString *name = NSStringFromClass(cls);
-    if (!name || [dyyySwizzledHostColorClasses containsObject:name]) return;
-    Method m = class_getInstanceMethod(cls, @selector(setBackgroundColor:));
-    if (!m) return;
-    IMP origIMP = method_getImplementation(m);
-    objc_setAssociatedObject(cls, dyyyHostColorOrigIMPKey,
-                             [NSValue valueWithPointer:(const void *)origIMP], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    const char *te = method_getTypeEncoding(m);
-    class_addMethod(cls, @selector(setBackgroundColor:), (IMP)dyyyHostSetBackgroundColorSwizzled, te);
-    Method cur = class_getInstanceMethod(cls, @selector(setBackgroundColor:));
-    if (method_getImplementation(cur) != (IMP)dyyyHostSetBackgroundColorSwizzled) {
-        method_setImplementation(cur, (IMP)dyyyHostSetBackgroundColorSwizzled);
-    }
-    [dyyySwizzledHostColorClasses addObject:name];
-    NSLog(@"[DYYY] white host setter hooked: %@", name);
-}
-
-static void dyyySwizzleHostEffectSetterOnce(Class cls) {
-    if (!cls) return;
-    if (!dyyySwizzledHostEffectClasses) dyyySwizzledHostEffectClasses = [NSMutableSet set];
-    NSString *name = NSStringFromClass(cls);
-    if (!name || [dyyySwizzledHostEffectClasses containsObject:name]) return;
-    Method m = class_getInstanceMethod(cls, @selector(setEffect:));
-    if (!m) return;
-    IMP origIMP = method_getImplementation(m);
-    objc_setAssociatedObject(cls, dyyyHostEffectOrigIMPKey,
-                             [NSValue valueWithPointer:(const void *)origIMP], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    const char *te = method_getTypeEncoding(m);
-    class_addMethod(cls, @selector(setEffect:), (IMP)dyyyHostSetEffectSwizzled, te);
-    Method cur = class_getInstanceMethod(cls, @selector(setEffect:));
-    if (method_getImplementation(cur) != (IMP)dyyyHostSetEffectSwizzled) {
-        method_setImplementation(cur, (IMP)dyyyHostSetEffectSwizzled);
-    }
-    [dyyySwizzledHostEffectClasses addObject:name];
-    NSLog(@"[DYYY] white effect host hooked: %@", name);
-}
-
-// 扫描 view 子树，收集当前呈现白底（backgroundColor / layer.backgroundColor / 材质 effect）的嫌疑宿主实例
-static void dyyyScanWhiteHostInView(UIView *v, NSMutableArray *outHosts) {
-    if (!v) return;
-    if (v.tag == 999) return; // 自身毛玻璃层整棵跳过
-    if ([v isKindOfClass:[UIVisualEffectView class]]) {
-        UIVisualEffectView *ev = (UIVisualEffectView *)v;
-        if (ev.effect && v.alpha >= 0.85f) [outHosts addObject:v];
-    }
-    BOOL isWhite = NO;
-    UIColor *bg = v.backgroundColor;
-    if (bg && CGColorGetAlpha(bg.CGColor) >= 0.9f && dyyyCGColorIsWhiteish(bg.CGColor)) isWhite = YES;
-    if (!isWhite) {
-        CGColorRef lc = v.layer.backgroundColor;
-        if (lc && CGColorGetAlpha(lc) >= 0.9f && dyyyCGColorIsWhiteish(lc)) isWhite = YES;
-    }
-    if (isWhite) [outHosts addObject:v];
-    for (UIView *sub in v.subviews) {
-        dyyyScanWhiteHostInView(sub, outHosts);
-    }
-}
-
-// v6: 节流式扫描评论可见 cell 树，发现白底宿主类即做 setter 级拦截（幂等，每 5 个 tick 跑一次）
-static void dyyyScanWhiteHostsAndSwizzle(id panelVC) {
-    UIView *panelView = ((UIViewController *)panelVC).view;
-    if (!panelView) return;
-    NSMutableArray *scrolls = [NSMutableArray array];
-    dyyyCollectCommentScrollViews(panelView, scrolls);
-    NSMutableArray *hosts = [NSMutableArray array];
-    for (UIView *sv in scrolls) {
-        NSArray *visibleCells = nil;
-        if ([sv isKindOfClass:[UITableView class]]) {
-            visibleCells = ((UITableView *)sv).visibleCells;
-        } else if ([sv isKindOfClass:[UICollectionView class]]) {
-            visibleCells = ((UICollectionView *)sv).visibleCells;
-        }
-        if (!visibleCells) continue;
-        for (UIView *cell in visibleCells) {
-            dyyyScanWhiteHostInView(cell, hosts);
-        }
-    }
-    for (UIView *h in hosts) {
-        Class cls = object_getClass(h);
-        dyyySwizzleHostColorSetterOnce(cls);
-        if ([h isKindOfClass:[UIVisualEffectView class]]) {
-            dyyySwizzleHostEffectSetterOnce(cls);
-        }
-    }
-}
-
 // ===== 挂窗前置于 viewWillAppear：布局前的首帧白也拦截（守护由随后的 viewDidLayoutSubviews 启动） =====
 static IMP dyyyOrigPanelViewWillAppear = NULL;
 
@@ -13777,18 +13646,155 @@ static void dyyyPanelViewWillAppearSwizzled(id self, SEL _cmd, BOOL animated) {
     dyyyFixInputBarIfNeeded(self);
 }
 
+// ===== v6.1-DIAG 标题行黑/白块诊断：dump 标题行 label 宿主链与相交实色块层 =====
+// 仅诊断包开启。目标：定位 2.2-9.6 黑块现象的视图来源（被摘 effect 后露出的深色宿主 / 误判白底宿主）。
+static BOOL dyyyDiagEnabled = YES; // DIAG 包强制开启；正式包需整体删除本区块
+
+static NSString *dyyyDiagColorDesc(CGColorRef cg) {
+    if (!cg) return @"nil";
+    const CGFloat *c = CGColorGetComponents(cg);
+    NSInteger n = CGColorGetNumberOfComponents(cg);
+    if (n >= 3) return [NSString stringWithFormat:@"(%.2f,%.2f,%.2f,a%.2f)", c[0], c[1], c[2], CGColorGetAlpha(cg)];
+    if (n == 2) return [NSString stringWithFormat:@"(%.2f,a%.2f)", c[0], CGColorGetAlpha(cg)];
+    return @"?";
+}
+
+static BOOL dyyyDiagIsBlackish(CGColorRef cg) {
+    if (!cg) return NO;
+    CGColorSpaceRef space = CGColorGetColorSpace(cg);
+    if (!space) return NO;
+    CGColorSpaceModel model = CGColorSpaceGetModel(space);
+    if (CGColorGetAlpha(cg) < 0.85f) return NO;
+    const CGFloat *c = CGColorGetComponents(cg);
+    if (model == kCGColorSpaceModelMonochrome) return c[0] <= 0.15f;
+    if (model == kCGColorSpaceModelRGB) return (c[0] <= 0.15f && c[1] <= 0.15f && c[2] <= 0.15f);
+    return NO;
+}
+
+// 视图当前是否呈“近白/近黑实色块”或带材质：诊断黑/白块覆盖物的候选
+static BOOL dyyyDiagViewLooksLikeSolidBlock(UIView *v) {
+    if (!v || v.hidden || v.alpha < 0.85f) return NO;
+    UIColor *bg = v.backgroundColor;
+    CGColorRef bgc = bg.CGColor;
+    if (bgc && CGColorGetAlpha(bgc) >= 0.85f && (dyyyCGColorIsWhiteish(bgc) || dyyyDiagIsBlackish(bgc))) return YES;
+    CGColorRef lbg = v.layer.backgroundColor;
+    if (lbg && CGColorGetAlpha(lbg) >= 0.85f && (dyyyCGColorIsWhiteish(lbg) || dyyyDiagIsBlackish(lbg))) return YES;
+    if ([v isKindOfClass:[UIVisualEffectView class]] && ((UIVisualEffectView *)v).effect) return YES;
+    return NO;
+}
+
+// 从 v 沿 superview 链逐级输出：class/tag/alpha/frame/backgroundColor/layer.backgroundColor/effect/text
+static void dyyyDiagDumpHostChain(UIView *v, UIView *rootCell, NSString *mark) {
+    UIView *cur = v;
+    int depth = 0;
+    while (cur && cur != rootCell.superview && depth < 14) {
+        CGRect fr = rootCell ? [rootCell convertRect:cur.bounds fromView:cur] : cur.frame;
+        NSString *textInfo = @"";
+        if ([cur isKindOfClass:[UILabel class]]) {
+            NSString *t = ((UILabel *)cur).text;
+            if (t.length > 12) t = [t substringToIndex:12];
+            textInfo = [NSString stringWithFormat:@" text=\"%@\"", t ?: @""];
+        }
+        NSString *effectInfo = @"";
+        if ([cur isKindOfClass:[UIVisualEffectView class]] && ((UIVisualEffectView *)cur).effect) {
+            effectInfo = [NSString stringWithFormat:@" effect=%@", NSStringFromClass([((UIVisualEffectView *)cur).effect class])];
+        }
+        NSLog(@"[DYYY-DIAG] %@ d=%d %@ cls=%@ tag=%ld alpha=%.2f frame=(%.0f,%.0f %.0fx%.0f) bg=%@ layerBg=%@%@%@",
+              mark, depth, (cur == v ? @"SELF>" : @"  up>"), NSStringFromClass([cur class]), (long)cur.tag,
+              cur.alpha, fr.origin.x, fr.origin.y, fr.size.width, fr.size.height,
+              dyyyDiagColorDesc(cur.backgroundColor.CGColor),
+              dyyyDiagColorDesc(cur.layer.backgroundColor),
+              effectInfo, textInfo);
+        cur = cur.superview;
+        depth++;
+    }
+}
+
+// 收集 root 子树中第一个文本 label（近似标题行：取 y 最小、高度合理的 UILabel），递归返回
+static UILabel *dyyyDiagWalkTopTextLabel(UIView *v, UIView *cell, CGFloat *outMinY) {
+    if (!v || v.tag == 999) return nil;
+    UILabel *hit = nil;
+    if ([v isKindOfClass:[UILabel class]]) {
+        UILabel *lb = (UILabel *)v;
+        NSString *t = lb.text;
+        if (t.length > 0 && lb.alpha > 0.5f && !lb.hidden) {
+            CGRect fr = [cell convertRect:lb.bounds fromView:lb];
+            if (fr.size.height > 0 && fr.size.height < 60 && fr.origin.y < *outMinY) {
+                *outMinY = fr.origin.y;
+                hit = lb;
+            }
+        }
+    }
+    for (UIView *s in v.subviews) {
+        UILabel *sub = dyyyDiagWalkTopTextLabel(s, cell, outMinY);
+        if (sub) hit = sub;
+    }
+    return hit;
+}
+
+// 判断 suspect 是否为 label 自身祖先链上的视图（祖先底色不会遮挡文字，仅作背景参考）
+static BOOL dyyyDiagIsAncestorOf(UIView *suspect, UIView *label) {
+    UIView *cur = label.superview;
+    while (cur) {
+        if (cur == suspect) return YES;
+        cur = cur.superview;
+    }
+    return NO;
+}
+
+// 遍历 cell 子树，找与标题行 label frame 相交的实色块覆盖层并 dump 其宿主链
+static void dyyyDiagWalkCovers(UIView *v, UIView *cell, UILabel *titleLabel, CGRect titleFr) {
+    if (!v || v.tag == 999) return;
+    if (v != titleLabel && dyyyDiagViewLooksLikeSolidBlock(v)) {
+        CGRect fr = [cell convertRect:v.bounds fromView:v];
+        if (CGRectIntersectsRect(fr, CGRectInset(titleFr, -2, -2)) && !dyyyDiagIsAncestorOf(v, titleLabel)) {
+            NSLog(@"[DYYY-DIAG] TITLE-ROW blocked by view frame=(%.0f,%.0f %.0fx%.0f) -> dump chain:", fr.origin.x, fr.origin.y, fr.size.width, fr.size.height);
+            dyyyDiagDumpHostChain(v, cell, @"COVER");
+        }
+    }
+    for (UIView *s in v.subviews) {
+        dyyyDiagWalkCovers(s, cell, titleLabel, titleFr);
+    }
+}
+
+// 面板级入口：dump 每个可见评论 cell 的标题行宿主链与覆盖层
+static void dyyyDiagDumpTitleRows(id panelVC) {
+    UIView *panelView = ((UIViewController *)panelVC).view;
+    if (!panelView) return;
+    NSMutableArray *scrolls = [NSMutableArray array];
+    dyyyCollectCommentScrollViews(panelView, scrolls);
+    for (UIView *sv in scrolls) {
+        NSArray *visibleCells = nil;
+        if ([sv isKindOfClass:[UITableView class]]) {
+            visibleCells = ((UITableView *)sv).visibleCells;
+        } else if ([sv isKindOfClass:[UICollectionView class]]) {
+            visibleCells = ((UICollectionView *)sv).visibleCells;
+        }
+        if (!visibleCells) continue;
+        for (UIView *cell in visibleCells) {
+            CGFloat minY = CGFLOAT_MAX;
+            UILabel *tl = dyyyDiagWalkTopTextLabel(cell, cell, &minY);
+            if (!tl) continue;
+            CGRect tfr = [cell convertRect:tl.bounds fromView:tl];
+            NSLog(@"[DYYY-DIAG] --- cell %@ title-label @y=%.0f ---", NSStringFromClass([cell class]), tfr.origin.y);
+            dyyyDiagDumpHostChain(tl, cell, @"TITLE-LABEL");
+            dyyyDiagWalkCovers(cell, cell, tl, tfr);
+        }
+    }
+}
+
 // 单轮守护：幂等清理；面板视图已脱离窗口时返回 NO 以停止守护
 static BOOL dyyyCommentGuardTickOnce(id panelVC) {
     UIView *panelView = ((UIViewController *)panelVC).view;
     if (!panelView || !panelView.window) return NO;
     dyyyScanCommentCellsAndSwizzle(panelVC); // 2.2-9.5: 收集可见 cell 并源头 swizzle（新复用 cell 类首次出现即挂 hook）
-    static int dyyyHostScanDiv = 0;
-    if ((++dyyyHostScanDiv % 5) == 0) {
-        dyyyScanWhiteHostsAndSwizzle(panelVC); // v6: 发现白底宿主类并做 setter 级拦截（0.25s 节流）
-    }
     dyyyClearCommentWhiteTree(panelView);    // 2.2-9.5: 双通道清白底（backgroundColor + layer.backgroundColor）
     dyyyPanelApplyBlurIfNeeded(panelVC);     // 面板树递归清白底 + 刷新/补建 tag999 毛玻璃（幂等）
     dyyyFixInputBarIfNeeded(panelVC);        // 独立层级的输入栏宿主持续清理
+    if (dyyyDiagEnabled) {
+        static int dyyyDiagTickDiv = 0;
+        if ((++dyyyDiagTickDiv % 40) == 0) dyyyDiagDumpTitleRows(panelVC); // ~2s 节流 dump
+    }
     return YES;
 }
 
